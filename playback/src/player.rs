@@ -29,6 +29,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::Narration,
 };
 use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -55,6 +56,7 @@ const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned
 pub type PlayerResult = Result<(), Error>;
 
 pub struct Player {
+    supports_narration: bool,
     commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
@@ -76,6 +78,9 @@ struct PlayerInternal {
 
     state: PlayerState,
     preload: PlayerPreload,
+    current_narration: Narration,
+    preload_narration: Narration,
+    narrating: bool,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
     sink_event_callback: Option<SinkEventCallback>,
@@ -104,9 +109,11 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        narration: Narration,
     },
     Preload {
         track_id: SpotifyUri,
+        narration: Narration,
     },
     Play,
     Pause,
@@ -138,10 +145,33 @@ enum PlayerCommand {
         track: bool,
     },
     EmitAutoPlayChangedEvent(bool),
+    EmitDjState(Option<String>, Option<DjSet>),
+    EmitDjJumpRejected,
+}
+
+/// A server-supplied DJ set boundary. No narration script leaves the engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DjSet {
+    pub uri: String,
+    pub uid: String,
+    /// Context rows through the chosen song, excluding manually queued songs.
+    pub consumed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
+    DjStateChanged {
+        context_uri: Option<String>,
+        next_set: Option<DjSet>,
+    },
+    DjJumpRejected,
+    /// Auxiliary speech is audible while the song clock remains stationary.
+    Narration {
+        track_id: SpotifyUri,
+        play_request_id: u64,
+        position_ms: u32,
+        active: bool,
+    },
     // Play request id changed
     PlayRequestIdChanged {
         play_request_id: u64,
@@ -259,6 +289,9 @@ impl PlayerEvent {
     pub fn get_play_request_id(&self) -> Option<u64> {
         use PlayerEvent::*;
         match self {
+            Narration {
+                play_request_id, ..
+            } => Some(*play_request_id),
             Loading {
                 play_request_id, ..
             }
@@ -368,7 +401,7 @@ impl NormalisationData {
         })
     }
 
-    fn get_factor(config: &PlayerConfig, data: NormalisationData) -> f64 {
+    pub(crate) fn get_factor(config: &PlayerConfig, data: NormalisationData) -> f64 {
         if !config.normalisation {
             return 1.0;
         }
@@ -451,6 +484,7 @@ impl Player {
         F: FnOnce() -> Box<dyn Sink> + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let supports_narration = !config.passthrough;
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -499,6 +533,9 @@ impl Player {
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
+                current_narration: Narration::default(),
+                preload_narration: Narration::default(),
+                narrating: false,
                 sink: sink_builder(),
                 sink_status: SinkStatus::Closed,
                 sink_event_callback: None,
@@ -529,6 +566,7 @@ impl Player {
         });
 
         Arc::new(Self {
+            supports_narration,
             commands: Some(cmd_tx),
             thread_handle: Some(handle),
         })
@@ -541,6 +579,18 @@ impl Player {
         true
     }
 
+    pub fn supports_narration(&self) -> bool {
+        self.supports_narration
+    }
+
+    pub fn emit_dj_state(&self, context_uri: Option<String>, next_set: Option<DjSet>) {
+        self.command(PlayerCommand::EmitDjState(context_uri, next_set));
+    }
+
+    pub fn emit_dj_jump_rejected(&self) {
+        self.command(PlayerCommand::EmitDjJumpRejected);
+    }
+
     fn command(&self, cmd: PlayerCommand) {
         if let Some(commands) = self.commands.as_ref() {
             if let Err(e) = commands.send(cmd) {
@@ -550,15 +600,33 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_with_narration(track_id, start_playing, position_ms, Narration::default());
+    }
+
+    pub fn load_with_narration(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        narration: Narration,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            narration,
         });
     }
 
     pub fn preload(&self, track_id: SpotifyUri) {
-        self.command(PlayerCommand::Preload { track_id });
+        self.preload_with_narration(track_id, Narration::default());
+    }
+
+    pub fn preload_with_narration(&self, track_id: SpotifyUri, narration: Narration) {
+        self.command(PlayerCommand::Preload {
+            track_id,
+            narration,
+        });
     }
 
     pub fn play(&self) {
@@ -989,8 +1057,9 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Narration,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
-        match track_uri {
+        let mut loaded = match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
                 self.load_remote_track(track_uri, position_ms).await
             }
@@ -1002,7 +1071,18 @@ impl PlayerTrackLoader {
                 error!("Cannot handle load of track with URI: <{track_uri}>",);
                 Err(LoadError::Unavailable)
             }
+        }?;
+        if position_ms == 0 {
+            loaded.decoder = narration
+                .attach(
+                    &self.session,
+                    &self.config,
+                    loaded.decoder,
+                    loaded.duration_ms,
+                )
+                .await;
         }
+        Ok(loaded)
     }
 
     async fn load_remote_track(
@@ -1474,6 +1554,7 @@ impl Future for PlayerInternal {
 
             if self.state.is_playing() {
                 self.ensure_sink_running();
+                let was_narrating = self.narrating;
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1488,6 +1569,25 @@ impl Future for PlayerInternal {
                     let track_id = track_id.clone();
                     match decoder.next_packet() {
                         Ok(result) => {
+                            let narrating = decoder.is_narration();
+                            let packet_gain = decoder
+                                .normalisation_override()
+                                .unwrap_or(normalisation_factor);
+                            let narration_changed = narrating != was_narrating;
+                            if narration_changed {
+                                *reported_nominal_start_time = None;
+                            }
+                            let narration_event =
+                                narration_changed.then(|| PlayerEvent::Narration {
+                                    track_id: track_id.clone(),
+                                    play_request_id,
+                                    position_ms: result
+                                        .as_ref()
+                                        .map_or(*stream_position_ms, |(position, _)| {
+                                            position.position_ms
+                                        }),
+                                    active: narrating,
+                                });
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
                                 let expected_position_ms = std::mem::replace(
@@ -1580,7 +1680,12 @@ impl Future for PlayerInternal {
                                 }
                             }
 
-                            self.handle_packet(result, normalisation_factor);
+                            if let Some(event) = narration_event {
+                                self.narrating = narrating;
+                                debug!(target: "librespot_dj", "Narration active: {narrating}");
+                                self.send_event(event);
+                            }
+                            self.handle_packet(result, packet_gain);
                         }
                         Err(e) => {
                             error!(
@@ -1791,6 +1896,12 @@ impl PlayerInternal {
         packet: Option<(AudioPacketPosition, AudioPacket)>,
         normalisation_factor: f64,
     ) {
+        if let Some(report) = &self.config.normalisation_report {
+            report.store(
+                normalisation_factor.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         match packet {
             Some((_, mut packet)) => {
                 if !packet.is_empty() {
@@ -1921,6 +2032,7 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
+        self.narrating = false;
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
@@ -2002,7 +2114,10 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        narration: Narration,
     ) -> PlayerResult {
+        let same_narration = self.current_narration == narration;
+        self.current_narration = narration.clone();
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -2029,7 +2144,7 @@ impl PlayerInternal {
             ..
         } = &self.state
         {
-            if *previous_track_id == track_id {
+            if *previous_track_id == track_id && same_narration {
                 let mut loaded_track = match mem::replace(&mut self.state, PlayerState::Invalid) {
                     PlayerState::EndOfTrack { loaded_track, .. } => loaded_track,
                     _ => {
@@ -2070,7 +2185,7 @@ impl PlayerInternal {
             ..
         } = self.state
         {
-            if *current_track_id == track_id {
+            if *current_track_id == track_id && same_narration {
                 // we can use the current decoder. Ensure it's at the correct position.
                 if position_ms != *stream_position_ms {
                     // This may be blocking.
@@ -2141,7 +2256,7 @@ impl PlayerInternal {
             ..
         } = &self.preload
         {
-            if track_id == *loaded_track_id {
+            if track_id == *loaded_track_id && self.preload_narration == narration {
                 let preload = std::mem::replace(&mut self.preload, PlayerPreload::None);
                 if let PlayerPreload::Ready {
                     track_id,
@@ -2175,7 +2290,10 @@ impl PlayerInternal {
             ..
         } = &self.preload
         {
-            if (track_id == *loaded_track_id) && (position_ms == 0) {
+            if (track_id == *loaded_track_id)
+                && (position_ms == 0)
+                && self.preload_narration == narration
+            {
                 let mut preload = PlayerPreload::None;
                 std::mem::swap(&mut preload, &mut self.preload);
                 if let PlayerPreload::Loading { loader, .. } = preload {
@@ -2193,8 +2311,8 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader
+            .unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms, narration)));
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -2207,7 +2325,7 @@ impl PlayerInternal {
         Ok(())
     }
 
-    fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+    fn handle_command_preload(&mut self, track_id: SpotifyUri, narration: Narration) {
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
@@ -2220,7 +2338,7 @@ impl PlayerInternal {
             ..
         } = &self.preload
         {
-            if *currently_loading == track_id {
+            if *currently_loading == track_id && self.preload_narration == narration {
                 // we're already preloading the requested track.
                 preload_track = false;
             } else {
@@ -2242,7 +2360,7 @@ impl PlayerInternal {
             ..
         } = &self.state
         {
-            if *current_track_id == track_id {
+            if *current_track_id == track_id && self.current_narration == narration {
                 // we already have the requested track loaded.
                 preload_track = false;
             }
@@ -2250,7 +2368,8 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            self.preload_narration = narration.clone();
+            let loader = self.load_track(track_id.clone(), 0, narration);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2275,6 +2394,7 @@ impl PlayerInternal {
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                Narration::default(),
             );
         }
 
@@ -2327,13 +2447,24 @@ impl PlayerInternal {
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
         debug!("command={cmd:?}");
         match cmd {
+            PlayerCommand::EmitDjState(context_uri, next_set) => {
+                self.send_event(PlayerEvent::DjStateChanged {
+                    context_uri,
+                    next_set,
+                });
+            }
+            PlayerCommand::EmitDjJumpRejected => self.send_event(PlayerEvent::DjJumpRejected),
             PlayerCommand::Load {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                narration,
+            } => self.handle_command_load(track_id, None, play, position_ms, narration)?,
 
-            PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+            PlayerCommand::Preload {
+                track_id,
+                narration,
+            } => self.handle_command_preload(track_id, narration),
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -2442,6 +2573,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        narration: Narration,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2461,7 +2593,7 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(loader.load_track(spotify_uri, position_ms, narration));
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -2522,6 +2654,8 @@ impl Drop for PlayerInternal {
 impl fmt::Debug for PlayerCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PlayerCommand::EmitDjState(..) => f.write_str("EmitDjState"),
+            PlayerCommand::EmitDjJumpRejected => f.write_str("EmitDjJumpRejected"),
             PlayerCommand::Load {
                 track_id,
                 play,
@@ -2533,7 +2667,7 @@ impl fmt::Debug for PlayerCommand {
                 .field(&play)
                 .field(&position_ms)
                 .finish(),
-            PlayerCommand::Preload { track_id } => {
+            PlayerCommand::Preload { track_id, .. } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
             PlayerCommand::Play => f.debug_tuple("Play").finish(),

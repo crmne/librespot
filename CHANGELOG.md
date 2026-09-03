@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- [connect] Experimental DJ session resolution and on-demand continuation pages
+- [playback] Optional Spotify narration through the existing decoder, with
+  mono speech conversion, bounded downloads, independent loudness, and a
+  stationary song clock during speech
+- [playback] `Narration` player event (breaking for exhaustive event matches)
+- [connect] Occurrence-aware DJ set jumps that preserve manually queued songs
+- [connect] Automatically keep DJ sessions unshuffled, including incoming transfers
+- [playback] DJ context/next-set state and rejected-jump events (breaking for exhaustive event matches)
+
 ### Fixed
 
 - [playback] Stop instead of advancing through the queue when Spotify refuses an audio key

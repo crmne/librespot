@@ -1832,6 +1832,7 @@ async fn get_setup() -> Setup {
             normalisation_knee_db,
             ditherer,
             position_update_interval: None,
+            normalisation_report: None,
             local_file_directories,
         }
     };
