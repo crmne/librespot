@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
 - [playback] Stop instead of advancing through the queue when Spotify refuses an audio key
 
 ## [0.8.0] - 2025-11-10
