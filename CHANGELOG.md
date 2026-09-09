@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
 - [playback] Stop instead of advancing through the queue when Spotify refuses an audio key
