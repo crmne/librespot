@@ -3,7 +3,7 @@ use std::{
     fmt, fs,
     fs::File,
     future::Future,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Cursor, Read, Seek, SeekFrom},
     mem,
     pin::Pin,
     process::exit,
@@ -29,6 +29,9 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::{
+        NarrationArtwork, NarrationDecoder, NarrationMetadata, NarrationPhase, with_narration_gain,
+    },
 };
 use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -93,6 +96,10 @@ struct PlayerInternal {
     player_id: usize,
     play_request_id_generator: SeqGenerator<u64>,
     last_progress_update: Instant,
+    /// Last logical DJ narration segment reported to event consumers.
+    last_narration_phase: Option<NarrationPhase>,
+    /// Artwork associated with the generated voice clips of the current item.
+    current_narration_artwork: NarrationArtwork,
 
     local_file_lookup: Arc<LocalFileLookup>,
 }
@@ -104,6 +111,7 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        narration: Option<NarrationMetadata>,
     },
     Preload {
         track_id: SpotifyUri,
@@ -218,6 +226,14 @@ pub enum PlayerEvent {
         track_id: SpotifyUri,
         position_ms: u32,
     },
+    /// The composed DJ stream moved between generated voice and music.
+    /// `None` means the current item is a regular track (or narration ended).
+    NarrationChanged {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        phase: Option<NarrationPhase>,
+        image: Option<String>,
+    },
     Seeked {
         play_request_id: u64,
         track_id: SpotifyUri,
@@ -287,6 +303,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Seeked {
+                play_request_id, ..
+            } => Some(*play_request_id),
+            NarrationChanged {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -516,6 +535,8 @@ impl Player {
                 player_id,
                 play_request_id_generator: SeqGenerator::new(0),
                 last_progress_update: Instant::now(),
+                last_narration_phase: None,
+                current_narration_artwork: NarrationArtwork::default(),
 
                 local_file_lookup: Arc::new(local_file_lookup),
             };
@@ -550,10 +571,21 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_with_narration(track_id, start_playing, position_ms, None);
+    }
+
+    pub fn load_with_narration(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        narration: Option<NarrationMetadata>,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            narration,
         });
     }
 
@@ -678,6 +710,7 @@ struct PlayerLoadedTrackData {
     duration_ms: u32,
     stream_position_ms: u32,
     is_explicit: bool,
+    narration_artwork: NarrationArtwork,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -710,12 +743,32 @@ enum PlayerPreload {
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
+/// Spotify Connect may label a playable track as `spotify:unknown:<id>` while
+/// transferring a DJ session. Promote valid base62 ids before they reach the
+/// loader/state machine so every playback path uses one canonical URI.
+fn normalize_track_uri(track_uri: SpotifyUri) -> SpotifyUri {
+    match track_uri {
+        SpotifyUri::Unknown { kind, id } => match SpotifyId::from_base62(&id) {
+            Ok(id) => {
+                info!(
+                    "[DJDBG] promoting playback URI spotify:unknown:{} to spotify:track",
+                    id.to_base62().unwrap_or_default()
+                );
+                SpotifyUri::Track { id }
+            }
+            Err(_) => SpotifyUri::Unknown { kind, id },
+        },
+        track_uri => track_uri,
+    }
+}
+
 enum PlayerState {
     Stopped,
     Loading {
         track_id: SpotifyUri,
         play_request_id: u64,
         start_playback: bool,
+        narration: Option<NarrationMetadata>,
         loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send>>,
     },
     Paused {
@@ -797,7 +850,7 @@ impl PlayerState {
         }
     }
 
-    fn playing_to_end_of_track(&mut self) {
+    fn playing_to_end_of_track(&mut self, narration_artwork: NarrationArtwork) {
         use self::PlayerState::*;
         let new_state = mem::replace(self, Invalid);
         match new_state {
@@ -826,6 +879,7 @@ impl PlayerState {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        narration_artwork,
                     },
                 };
             }
@@ -985,14 +1039,108 @@ impl PlayerTrackLoader {
         Some(data_rate.ceil() as usize)
     }
 
+    async fn load_narration_segment(
+        &self,
+        ssml: &str,
+        language: &str,
+        voice: u32,
+        provider: u32,
+        loudness_db: Option<f64>,
+        true_peak_db: Option<f64>,
+    ) -> Option<(Decoder, u32)> {
+        info!(
+            "[DJDBG] resolving narration segment ({} SSML bytes)",
+            ssml.len()
+        );
+        let url = match tokio::time::timeout(
+            Duration::from_secs(8),
+            self.session
+                .spclient()
+                .get_tts_url(ssml, language, voice, provider),
+        )
+        .await
+        {
+            Ok(Ok(url)) => url,
+            Ok(Err(error)) => {
+                warn!("DJ narration URL resolution failed: {error}");
+                return None;
+            }
+            Err(_) => {
+                warn!("DJ narration URL resolution timed out");
+                return None;
+            }
+        };
+
+        let bytes = match tokio::time::timeout(
+            Duration::from_secs(8),
+            self.session.spclient().request_url(&url),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                warn!("DJ narration audio download failed: {error}");
+                return None;
+            }
+            Err(_) => {
+                warn!("DJ narration audio download timed out");
+                return None;
+            }
+        };
+
+        let mut hint = Hint::new();
+        hint.with_extension("mp3");
+        let decoder = match SymphoniaDecoder::new_narration(Cursor::new(bytes.to_vec()), hint) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                warn!("DJ narration audio decode failed: {error}");
+                return None;
+            }
+        };
+        let duration_ms = decoder.duration_ms();
+        if duration_ms == 0 {
+            warn!("DJ narration audio has no duration");
+            return None;
+        }
+
+        let gain = crate::narration::narration_gain(
+            loudness_db,
+            true_peak_db,
+            self.config.normalisation_pregain_db,
+        );
+        if let Some(gain) = gain {
+            info!(
+                "[DJDBG] narration gain: loudness_db={loudness_db:?}, true_peak_db={true_peak_db:?}, factor={gain:.3}"
+            );
+        } else {
+            debug!(
+                "[DJDBG] narration gain unavailable: loudness_db={loudness_db:?}, true_peak_db={true_peak_db:?}"
+            );
+        }
+
+        info!("[DJDBG] narration segment decoded ({} ms)", duration_ms);
+        Some((
+            with_narration_gain(
+                Box::new(decoder),
+                loudness_db,
+                true_peak_db,
+                self.config.normalisation_pregain_db,
+            ),
+            duration_ms,
+        ))
+    }
+
     async fn load_track(
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<NarrationMetadata>,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
+        let track_uri = normalize_track_uri(track_uri);
         match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
-                self.load_remote_track(track_uri, position_ms).await
+                self.load_remote_track(track_uri, position_ms, narration)
+                    .await
             }
             SpotifyUri::Local { .. } => self
                 .load_local_track(track_uri, position_ms)
@@ -1009,6 +1157,7 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<NarrationMetadata>,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
@@ -1018,7 +1167,7 @@ impl PlayerTrackLoader {
             }
         };
 
-        let audio_item = match AudioItem::get_file(&self.session, track_uri).await {
+        let mut audio_item = match AudioItem::get_file(&self.session, track_uri).await {
             Ok(audio) => match self.find_available_alternative(audio).await {
                 Some(audio) => audio,
                 None => {
@@ -1208,7 +1357,54 @@ impl PlayerTrackLoader {
                 }
             };
 
-            let duration_ms = audio_item.duration_ms;
+            let mut duration_ms = audio_item.duration_ms;
+
+            // DJ narration is optional.  A failed resolver/download must never
+            // make the actual track unavailable, so each clip is loaded on a
+            // best-effort basis and the main decoder remains the fallback.
+            if !self.config.passthrough {
+                if let Some(ref narration) = narration {
+                    let intro = if let Some(ref ssml) = narration.intro_ssml {
+                        self.load_narration_segment(
+                            ssml,
+                            &narration.language,
+                            narration.intro_voice,
+                            narration.intro_provider,
+                            narration.intro_loudness_db,
+                            narration.intro_true_peak_db,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    let outro = if let Some(ref ssml) = narration.outro_ssml {
+                        self.load_narration_segment(
+                            ssml,
+                            &narration.language,
+                            narration.outro_voice,
+                            narration.outro_provider,
+                            narration.outro_loudness_db,
+                            narration.outro_true_peak_db,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+
+                    if intro.is_some() || outro.is_some() {
+                        let (composite, composed_duration_ms) =
+                            NarrationDecoder::new(intro, decoder, duration_ms, outro);
+                        decoder = composite;
+                        duration_ms = composed_duration_ms;
+                        audio_item.duration_ms = duration_ms;
+                        info!(
+                            "DJ narration enabled for <{}> ({} ms total)",
+                            audio_item.name, duration_ms
+                        );
+                    }
+                }
+            }
+
             // Don't try to seek past the track's duration.
             // If the position is invalid just start from
             // the beginning of the track.
@@ -1251,6 +1447,10 @@ impl PlayerTrackLoader {
                 duration_ms,
                 stream_position_ms,
                 is_explicit,
+                narration_artwork: narration
+                    .as_ref()
+                    .map(NarrationMetadata::artwork)
+                    .unwrap_or_default(),
             });
         }
     }
@@ -1330,6 +1530,7 @@ impl PlayerTrackLoader {
             duration_ms: duration.as_millis() as u32,
             stream_position_ms,
             is_explicit: false,
+            narration_artwork: NarrationArtwork::default(),
             audio_item: AudioItem {
                 duration_ms: duration.as_millis() as u32,
                 uri: track_uri.to_uri().unwrap_or_default(),
@@ -1391,6 +1592,7 @@ impl Future for PlayerInternal {
                 ref track_id,
                 start_playback,
                 play_request_id,
+                ..
             } = self.state
             {
                 // The loader may be terminated if we are trying to load the same track
@@ -1472,6 +1674,9 @@ impl Future for PlayerInternal {
                 }
             }
 
+            let previous_narration_phase = self.last_narration_phase;
+            let mut narration_change = None;
+
             if self.state.is_playing() {
                 self.ensure_sink_running();
 
@@ -1488,6 +1693,16 @@ impl Future for PlayerInternal {
                     let track_id = track_id.clone();
                     match decoder.next_packet() {
                         Ok(result) => {
+                            // NarrationDecoder exposes its segment boundaries through the
+                            // decoder trait. Emit only transitions so the UI can show DJ Livi
+                            // during voice clips and restore the real song during music.
+                            let narration_phase = result.as_ref().and_then(|(position, _)| {
+                                decoder.narration_phase(position.position_ms)
+                            });
+                            if narration_phase != previous_narration_phase {
+                                narration_change =
+                                    Some((play_request_id, track_id.clone(), narration_phase));
+                            }
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
                                 let expected_position_ms = std::mem::replace(
@@ -1596,6 +1811,20 @@ impl Future for PlayerInternal {
                     error!("PlayerInternal poll: Invalid PlayerState");
                     exit(1);
                 };
+            }
+
+            if let Some((play_request_id, track_id, phase)) = narration_change {
+                info!("[DJDBG] narration phase changed: track={track_id}, phase={phase:?}");
+                self.last_narration_phase = phase;
+                let image = phase
+                    .and_then(|phase| self.current_narration_artwork.image_for_phase(phase))
+                    .map(str::to_owned);
+                self.send_event(PlayerEvent::NarrationChanged {
+                    play_request_id,
+                    track_id,
+                    phase,
+                    image,
+                });
             }
 
             if let PlayerState::Playing {
@@ -1714,6 +1943,14 @@ impl PlayerInternal {
                 let track_id = track_id.clone();
 
                 self.ensure_sink_stopped(false);
+                self.last_narration_phase = None;
+                self.send_event(PlayerEvent::NarrationChanged {
+                    track_id: track_id.clone(),
+                    play_request_id,
+                    phase: None,
+                    image: None,
+                });
+                self.current_narration_artwork = NarrationArtwork::default();
                 self.send_event(PlayerEvent::Stopped {
                     track_id,
                     play_request_id,
@@ -1895,7 +2132,8 @@ impl PlayerInternal {
             }
 
             None => {
-                self.state.playing_to_end_of_track();
+                self.state
+                    .playing_to_end_of_track(self.current_narration_artwork.clone());
                 if let PlayerState::EndOfTrack {
                     ref track_id,
                     play_request_id,
@@ -1922,10 +2160,21 @@ impl PlayerInternal {
         start_playback: bool,
     ) {
         let audio_item = Box::new(loaded_track.audio_item.clone());
+        self.current_narration_artwork = loaded_track.narration_artwork.clone();
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
 
         let position_ms = loaded_track.stream_position_ms;
+        let narration_phase = loaded_track.decoder.narration_phase(position_ms);
+        self.last_narration_phase = narration_phase;
+        self.send_event(PlayerEvent::NarrationChanged {
+            play_request_id,
+            track_id: track_id.clone(),
+            phase: narration_phase,
+            image: narration_phase
+                .and_then(|phase| self.current_narration_artwork.image_for_phase(phase))
+                .map(str::to_owned),
+        });
 
         let mut config = self.config.clone();
         if config.normalisation_type == NormalisationType::Auto {
@@ -2002,7 +2251,9 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        narration: Option<NarrationMetadata>,
     ) -> PlayerResult {
+        let track_id = normalize_track_uri(track_id);
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -2113,6 +2364,7 @@ impl PlayerInternal {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        narration_artwork: self.current_narration_artwork.clone(),
                     };
 
                     self.preload = PlayerPreload::None;
@@ -2136,29 +2388,32 @@ impl PlayerInternal {
         }
 
         // Check if the requested track has been preloaded already. If so use the preloaded data.
-        if let PlayerPreload::Ready {
-            track_id: loaded_track_id,
-            ..
-        } = &self.preload
-        {
-            if track_id == *loaded_track_id {
-                let preload = std::mem::replace(&mut self.preload, PlayerPreload::None);
-                if let PlayerPreload::Ready {
-                    track_id,
-                    mut loaded_track,
-                } = preload
-                {
-                    if position_ms != loaded_track.stream_position_ms {
-                        // This may be blocking
-                        loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
+        if narration.is_none() {
+            if let PlayerPreload::Ready {
+                track_id: loaded_track_id,
+                ..
+            } = &self.preload
+            {
+                if track_id == *loaded_track_id {
+                    let preload = std::mem::replace(&mut self.preload, PlayerPreload::None);
+                    if let PlayerPreload::Ready {
+                        track_id,
+                        mut loaded_track,
+                    } = preload
+                    {
+                        if position_ms != loaded_track.stream_position_ms {
+                            // This may be blocking
+                            loaded_track.stream_position_ms =
+                                loaded_track.decoder.seek(position_ms)?;
+                        }
+                        self.start_playback(track_id, play_request_id, *loaded_track, play);
+                        return Ok(());
+                    } else {
+                        return Err(Error::internal(format!(
+                            "PlayerInternal::handle_command_loading preloaded track: invalid state: {:?}",
+                            self.state
+                        )));
                     }
-                    self.start_playback(track_id, play_request_id, *loaded_track, play);
-                    return Ok(());
-                } else {
-                    return Err(Error::internal(format!(
-                        "PlayerInternal::handle_command_loading preloaded track: invalid state: {:?}",
-                        self.state
-                    )));
                 }
             }
         }
@@ -2170,16 +2425,20 @@ impl PlayerInternal {
         });
 
         // Try to extract a pending loader from the preloading mechanism
-        let loader = if let PlayerPreload::Loading {
-            track_id: loaded_track_id,
-            ..
-        } = &self.preload
-        {
-            if (track_id == *loaded_track_id) && (position_ms == 0) {
-                let mut preload = PlayerPreload::None;
-                std::mem::swap(&mut preload, &mut self.preload);
-                if let PlayerPreload::Loading { loader, .. } = preload {
-                    Some(loader)
+        let loader = if narration.is_none() {
+            if let PlayerPreload::Loading {
+                track_id: loaded_track_id,
+                ..
+            } = &self.preload
+            {
+                if (track_id == *loaded_track_id) && (position_ms == 0) {
+                    let mut preload = PlayerPreload::None;
+                    std::mem::swap(&mut preload, &mut self.preload);
+                    if let PlayerPreload::Loading { loader, .. } = preload {
+                        Some(loader)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -2193,14 +2452,16 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader.unwrap_or_else(|| {
+            Box::pin(self.load_track(track_id.clone(), position_ms, narration.clone()))
+        });
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
             track_id,
             play_request_id,
             start_playback: play,
+            narration,
             loader,
         };
 
@@ -2208,6 +2469,7 @@ impl PlayerInternal {
     }
 
     fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+        let track_id = normalize_track_uri(track_id);
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
@@ -2250,7 +2512,7 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(track_id.clone(), 0, None);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2267,6 +2529,7 @@ impl PlayerInternal {
             ref track_id,
             play_request_id,
             start_playback,
+            ref narration,
             ..
         } = self.state
         {
@@ -2275,6 +2538,7 @@ impl PlayerInternal {
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                narration.clone(),
             );
         }
 
@@ -2331,7 +2595,8 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                narration,
+            } => self.handle_command_load(track_id, None, play, position_ms, narration)?,
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
 
@@ -2442,6 +2707,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<NarrationMetadata>,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2461,7 +2727,7 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(loader.load_track(spotify_uri, position_ms, narration));
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);

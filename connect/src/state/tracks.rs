@@ -1,6 +1,6 @@
 use crate::{
     core::{Error, SpotifyUri},
-    protocol::player::ProvidedTrack,
+    protocol::{context::Context, player::ProvidedTrack},
     state::{
         ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE, SPOTIFY_MAX_PREV_TRACKS_SIZE, StateError,
         context::ContextType,
@@ -15,6 +15,12 @@ use rand::Rng;
 pub const IDENTIFIER_DELIMITER: &str = "delimiter";
 
 impl<'ct> ConnectState {
+    pub(crate) fn normalize_unknown_track_uri(uri: &str) -> String {
+        uri.strip_prefix("spotify:unknown:")
+            .map(|id| format!("spotify:track:{id}"))
+            .unwrap_or_else(|| uri.to_string())
+    }
+
     fn new_delimiter(iteration: i64) -> ProvidedTrack {
         let mut delimiter = ProvidedTrack {
             uri: format!("spotify:{IDENTIFIER_DELIMITER}"),
@@ -39,11 +45,16 @@ impl<'ct> ConnectState {
     }
 
     fn get_next_track(&mut self) -> Option<ProvidedTrack> {
-        if self.next_tracks().is_empty() {
-            None
-        } else {
+        if !self.next_tracks().is_empty() {
             // todo: O(n), but technically only maximal O(SPOTIFY_MAX_NEXT_TRACKS_SIZE) aka O(80)
             Some(self.next_tracks_mut().remove(0))
+        } else if !self.dj_next_tracks.is_empty() {
+            // DJ tracks are announced by Connect and cannot be fetched from a
+            // regular context endpoint. Keep them separate from the explicit
+            // user queue, but consume them with the same next-track flow.
+            Some(self.dj_next_tracks.remove(0))
+        } else {
+            None
         }
     }
 
@@ -129,11 +140,19 @@ impl<'ct> ConnectState {
         };
 
         let new_track = match new_track {
-            None => return Ok(None),
+            None => {
+                self.update_queue_revision();
+                return Ok(None);
+            }
             Some(t) => t,
         };
 
-        self.fill_up_next_tracks()?;
+        // Spotify DJ supplies its own session-specific queue. Trying to fill
+        // from the one-track transfer context would either duplicate the
+        // current track or trigger another context resolution request.
+        if !self.is_dj_context() {
+            self.fill_up_next_tracks()?;
+        }
 
         let update_index = if new_track.is_queue() {
             None
@@ -143,6 +162,16 @@ impl<'ct> ConnectState {
         } else {
             match new_track.get_context_index() {
                 Some(new_index) => Some(new_index as u32),
+                None if self.is_dj_context() => {
+                    // DJ tracks come from the session queue rather than a
+                    // paged context, so Spotify does not provide a context
+                    // index for them.
+                    debug!(
+                        "[DJDBG] advancing to dynamic DJ track without context_index: {}",
+                        new_track.uri
+                    );
+                    None
+                }
                 None => {
                     error!("the given context track had no set context_index");
                     None
@@ -158,6 +187,7 @@ impl<'ct> ConnectState {
 
         self.set_track(new_track);
         self.update_restrictions();
+        self.update_queue_revision();
 
         Ok(Some(self.player().index.track))
     }
@@ -217,6 +247,7 @@ impl<'ct> ConnectState {
         }
 
         self.update_restrictions();
+        self.update_queue_revision();
 
         Ok(Some(self.current_track(|t| t)))
     }
@@ -228,7 +259,8 @@ impl<'ct> ConnectState {
         access(&self.player().track)
     }
 
-    pub fn set_track(&mut self, track: ProvidedTrack) {
+    pub fn set_track(&mut self, mut track: ProvidedTrack) {
+        track.uri = Self::normalize_unknown_track_uri(&track.uri);
         self.player_mut().track = MessageField::some(track)
     }
 
@@ -247,6 +279,21 @@ impl<'ct> ConnectState {
                 self.queue_count += 1;
             });
 
+        // DJ/Connect updates may omit uri and carry the canonical URI in
+        // metadata instead.
+        tracks
+            .iter_mut()
+            .filter(|t| t.uri.is_empty())
+            .for_each(|t| {
+                if let Some(uri) = t
+                    .metadata
+                    .get("canonical_track_uri")
+                    .filter(|uri| !uri.is_empty())
+                {
+                    t.uri = uri.clone();
+                }
+            });
+
         // when you drag 'n drop the current track in the queue view into the "Next from: ..."
         // section, it is only send as an empty item with just the provider and metadata, so we have
         // to provide set the uri from the current track manually
@@ -255,7 +302,142 @@ impl<'ct> ConnectState {
             .filter(|t| t.uri.is_empty())
             .for_each(|t| t.uri = self.current_track(|ct| ct.uri.clone()));
 
+        tracks.iter_mut().for_each(|track| {
+            track.uri = Self::normalize_unknown_track_uri(&track.uri);
+        });
+
         self.player_mut().next_tracks = tracks;
+    }
+
+    pub fn cache_dj_next_tracks(&mut self, mut tracks: Vec<ProvidedTrack>) {
+        for track in &mut tracks {
+            if track.uri.is_empty() {
+                if let Some(uri) = track
+                    .metadata
+                    .get("canonical_track_uri")
+                    .filter(|uri| !uri.is_empty())
+                {
+                    track.uri = uri.clone();
+                }
+            }
+            track.uri = Self::normalize_unknown_track_uri(&track.uri);
+        }
+
+        tracks.retain(|track| !track.uri.is_empty() && !track.uri.contains('?'));
+        if tracks.is_empty() {
+            return;
+        }
+
+        let previous_tracks = std::mem::take(&mut self.dj_next_tracks);
+        // Preserve metadata obtained from the Lexicon session when a later
+        // Connect update refreshes the same queue with leaner track entries.
+        for track in &mut tracks {
+            if let Some(previous) = previous_tracks
+                .iter()
+                .find(|previous| Self::normalize_unknown_track_uri(&previous.uri) == track.uri)
+            {
+                for (key, value) in &previous.metadata {
+                    track
+                        .metadata
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+
+        debug!("caching {} DJ next tracks", tracks.len());
+        self.dj_mode = true;
+        self.dj_next_tracks = tracks;
+        self.update_queue_revision();
+    }
+
+    /// Merge tracks from a resolved DJ session into the Connect-provided queue.
+    /// The session response may contain narration metadata that is absent from
+    /// ClusterUpdate, so existing entries are enriched and new entries are
+    /// appended without disturbing Spotify's announced order.
+    pub fn merge_dj_context_tracks(&mut self, context: &Context) -> Result<(), Error> {
+        let context_uri = context.uri.as_deref();
+        let current_uri = Self::normalize_unknown_track_uri(&self.current_track(|t| &t.uri));
+        let mut tracks = Vec::new();
+
+        for page in &context.pages {
+            for track in &page.tracks {
+                let provided = match self.context_to_provided_track(
+                    track,
+                    context_uri,
+                    None,
+                    Some(&page.metadata),
+                    None,
+                ) {
+                    Ok(track) => track,
+                    Err(why) => {
+                        warn!("[DJDBG] skipping invalid track from DJ session context: {why}");
+                        continue;
+                    }
+                };
+
+                if Self::normalize_unknown_track_uri(&provided.uri) != current_uri {
+                    tracks.push(provided);
+                }
+            }
+        }
+
+        if tracks.is_empty() {
+            return Ok(());
+        }
+
+        let mut merged = 0;
+        let mut added = 0;
+        for mut track in tracks {
+            track.uri = Self::normalize_unknown_track_uri(&track.uri);
+            if track.uri.is_empty() || track.uri.contains('?') {
+                continue;
+            }
+
+            if let Some(existing) = self
+                .dj_next_tracks
+                .iter_mut()
+                .find(|existing| Self::normalize_unknown_track_uri(&existing.uri) == track.uri)
+            {
+                existing.metadata.extend(track.metadata);
+                merged += 1;
+            } else {
+                self.dj_next_tracks.push(track);
+                added += 1;
+            }
+        }
+
+        if merged > 0 || added > 0 {
+            self.dj_mode = true;
+            self.update_queue_revision();
+            debug!(
+                "[DJDBG] merged DJ session tracks: enriched={}, added={}",
+                merged, added
+            );
+            info!(
+                "[DJDBG] DJ queue ready: current={}, enriched={}, added={}, next={}",
+                current_uri,
+                merged,
+                added,
+                self.dj_next_tracks.len()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn take_dj_next_tracks(&mut self) -> Vec<ProvidedTrack> {
+        std::mem::take(&mut self.dj_next_tracks)
+    }
+
+    pub fn restore_dj_next_tracks(&mut self, tracks: Vec<ProvidedTrack>) {
+        if tracks.is_empty() {
+            return;
+        }
+
+        self.dj_mode = true;
+        self.dj_next_tracks = tracks;
+        self.update_queue_revision();
     }
 
     pub fn set_prev_tracks(&mut self, tracks: Vec<ProvidedTrack>) {
@@ -287,6 +469,10 @@ impl<'ct> ConnectState {
     }
 
     pub fn fill_up_next_tracks(&mut self) -> Result<(), Error> {
+        if self.is_dj_context() {
+            return Ok(());
+        }
+
         let ctx = self.get_context(self.fill_up_context)?;
         let mut new_index = ctx.index.track as usize;
         let mut iteration = ctx.index.page;
@@ -360,18 +546,29 @@ impl<'ct> ConnectState {
     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
         let next = if self.repeat_track() {
             self.current_track(|t| &t.uri)
+        } else if let Some(track) = self.next_tracks().first() {
+            &track.uri
         } else {
-            &self.next_tracks().first()?.uri
+            &self.dj_next_tracks.first()?.uri
         };
 
-        SpotifyUri::from_uri(next).ok()
+        // DJ transfers can leave the raw track id tagged as `spotify:unknown`.
+        // Playback accepts the canonical track URI, while the preloader parses
+        // this value directly, so normalize before handing it to the player.
+        let normalized = Self::normalize_unknown_track_uri(next);
+        debug!(
+            "[DJDBG] preview next track: raw_uri={}, normalized_uri={}",
+            next, normalized
+        );
+        SpotifyUri::from_uri(&normalized).ok()
     }
 
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {
+        let available = self.next_tracks().len() + self.dj_next_tracks.len();
         if let Some(min) = min {
-            self.next_tracks().len() >= min
+            available >= min
         } else {
-            !self.next_tracks().is_empty()
+            available > 0
         }
     }
 
@@ -440,5 +637,22 @@ impl<'ct> ConnectState {
             self.update_queue_revision();
         }
         self.update_restrictions();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectState;
+
+    #[test]
+    fn normalizes_unknown_track_uri() {
+        assert_eq!(
+            ConnectState::normalize_unknown_track_uri("spotify:unknown:1kuGVB7EU95pJObxwvfwKS"),
+            "spotify:track:1kuGVB7EU95pJObxwvfwKS"
+        );
+        assert_eq!(
+            ConnectState::normalize_unknown_track_uri("spotify:track:1kuGVB7EU95pJObxwvfwKS"),
+            "spotify:track:1kuGVB7EU95pJObxwvfwKS"
+        );
     }
 }

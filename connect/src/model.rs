@@ -44,6 +44,9 @@ pub struct LoadRequestOptions {
     ///
     /// If `None` is provided and `shuffle` is `true`, a random track is played, otherwise the first
     pub playing_track: Option<PlayingTrack>,
+    /// Resolve the context even when its URI matches the current one.
+    /// Spotify DJ uses a stable URI with a fresh HM session on each start.
+    pub force_resolve: bool,
 }
 
 /// The options which decide how the playback is started

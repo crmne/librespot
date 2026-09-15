@@ -226,6 +226,20 @@ impl HttpClient {
         Ok(response.into_body().collect().await?.to_bytes())
     }
 
+    /// Send a request without interpreting the response status code.
+    ///
+    /// A small number of Spotify endpoints intentionally use HTTP redirects as
+    /// an application-level response (for example, the DJ narration resolver
+    /// returns a signed audio URL in `Location`).  The normal request path
+    /// treats every non-2xx status as an error, so callers that understand such
+    /// endpoints can use this escape hatch and inspect the response themselves.
+    pub async fn request_no_redirect(
+        &self,
+        req: Request<Bytes>,
+    ) -> Result<Response<Incoming>, Error> {
+        Ok(self.request_fut(req)?.await?)
+    }
+
     pub fn request_stream(&self, req: Request<Bytes>) -> Result<IntoStream<ResponseFuture>, Error> {
         Ok(self.request_fut(req)?.into_stream())
     }

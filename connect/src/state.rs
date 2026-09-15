@@ -40,6 +40,9 @@ use thiserror::Error;
 const SPOTIFY_MAX_PREV_TRACKS_SIZE: usize = 10;
 const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
 
+pub(crate) const DJ_CONTEXT_METADATA_KEY: &str = "lexicon_set_type";
+pub(crate) const DJ_CONTEXT_METADATA_VALUE: &str = "your_dj";
+
 #[derive(Debug, Error)]
 pub(super) enum StateError {
     #[error("the current track couldn't be resolved from the transfer state")]
@@ -131,6 +134,12 @@ pub(super) struct ConnectState {
 
     /// The volume adjustment per step when handling individual volume adjustments.
     pub volume_step_size: u16,
+
+    /// Tracks announced by Spotify Connect for a DJ context. The queue is
+    /// session-specific; the normal context API cannot provide it, although the
+    /// session HM context can enrich its metadata when available.
+    dj_next_tracks: Vec<ProvidedTrack>,
+    dj_mode: bool,
 }
 
 impl ConnectState {
@@ -215,6 +224,8 @@ impl ConnectState {
     fn reset(&mut self) {
         self.set_active(false);
         self.queue_count = 0;
+        self.dj_next_tracks.clear();
+        self.dj_mode = false;
 
         // preserve the session_id
         let session_id = self.player().session_id.clone();
@@ -265,6 +276,33 @@ impl ConnectState {
     pub fn is_playing(&self) -> bool {
         let player = self.player();
         player.is_playing && !player.is_paused
+    }
+
+    pub fn set_dj_mode(&mut self, enabled: bool) {
+        self.dj_mode = enabled;
+        if !enabled {
+            self.dj_next_tracks.clear();
+        }
+    }
+
+    pub fn is_dj_context(&self) -> bool {
+        self.dj_mode
+            || self
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.metadata.get(DJ_CONTEXT_METADATA_KEY))
+                .is_some_and(|value| value == DJ_CONTEXT_METADATA_VALUE)
+            || self
+                .player()
+                .context_metadata
+                .get(DJ_CONTEXT_METADATA_KEY)
+                .is_some_and(|value| value == DJ_CONTEXT_METADATA_VALUE)
+            || self
+                .player()
+                .track
+                .as_ref()
+                .and_then(|track| track.metadata.get(DJ_CONTEXT_METADATA_KEY))
+                .is_some_and(|value| value == DJ_CONTEXT_METADATA_VALUE)
     }
 
     /// Returns the `is_paused` state value as perceived by other connect devices
@@ -384,6 +422,9 @@ impl ConnectState {
     pub fn update_queue_revision(&mut self) {
         let mut state = DefaultHasher::new();
         self.next_tracks()
+            .iter()
+            .for_each(|t| t.uri.hash(&mut state));
+        self.dj_next_tracks
             .iter()
             .for_each(|t| t.uri.hash(&mut state));
         self.player_mut().queue_revision = state.finish().to_string()

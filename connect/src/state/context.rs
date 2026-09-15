@@ -50,6 +50,15 @@ pub enum ResetContext<'s> {
 /// Expected `page_url` should look something like the following:
 /// `hm://artistplaycontext/v1/page/spotify/album/5LFzwirfFwBKXJQGfwmiMY/km_artist`
 fn page_url_to_uri(page_url: &str) -> String {
+    // Lexicon pagination URLs are opaque resolver tokens. They are not
+    // artist/album page URLs and must be passed to the SpClient verbatim;
+    // converting them to a Spotify URI would discard the session and cursor.
+    if page_url.starts_with("hm://lexicon-session-provider/")
+        || page_url.starts_with("hm://context-resolve/")
+    {
+        return page_url.to_string();
+    }
+
     let split = if let Some(rest) = page_url.strip_prefix("hm://") {
         rest.split('/')
     } else {
@@ -116,8 +125,24 @@ impl ConnectState {
             ResetContext::Completely => {
                 self.context = None;
                 self.autoplay_context = None;
+                self.set_dj_mode(false);
+                // A direct DJ start creates a new Lexicon session. Do not let
+                // tracks announced by the previous session survive a switch
+                // through another playlist (or a later DJ start).
+                let stale_dj_tracks = self.dj_next_tracks.len();
+                self.dj_next_tracks.clear();
+                if stale_dj_tracks > 0 {
+                    info!(
+                        "[DJDBG] cleared {stale_dj_tracks} stale tracks from the previous DJ session"
+                    );
+                }
 
                 let player = self.player_mut();
+                // Do not let the previous DJ track keep the context marked as
+                // DJ while a new playlist is being resolved. Its narration
+                // metadata would otherwise leak into the next load.
+                player.track = MessageField::none();
+                player.context_metadata.clear();
                 player.context_uri.clear();
                 player.context_url.clear();
             }
@@ -190,6 +215,14 @@ impl ConnectState {
         mut context: Context,
         ty: ContextType,
     ) -> Result<Option<Vec<String>>, Error> {
+        if matches!(ty, ContextType::Default) {
+            let is_dj = context
+                .metadata
+                .get(crate::state::DJ_CONTEXT_METADATA_KEY)
+                .is_some_and(|value| value == crate::state::DJ_CONTEXT_METADATA_VALUE);
+            self.set_dj_mode(is_dj);
+        }
+
         if context.pages.iter().all(|p| p.tracks.is_empty()) {
             error!("context didn't have any tracks: {context:#?}");
             Err(StateError::ContextHasNoTracks)?;
@@ -211,6 +244,16 @@ impl ConnectState {
             None => Err(StateError::ContextHasNoTracks)?,
             Some(p) => p,
         };
+
+        // A Lexicon response commonly contains one page of tracks and puts
+        // the cursor for the next batch on that page. Preserve the opaque HM
+        // URL before consuming the page; dropping it leaves dynamic contexts
+        // (notably Spotify DJ) with no way to fetch more tracks.
+        let first_page_next_page_url = page
+            .next_page_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+            .map(page_url_to_uri);
 
         debug!(
             "updated context {ty:?} to <{:?}> ({} tracks)",
@@ -272,17 +315,23 @@ impl ConnectState {
             }
         }
 
-        if next_contexts.is_empty() {
+        if next_contexts.is_empty() && first_page_next_page_url.is_none() {
             return Ok(None);
         }
 
         // load remaining contexts
-        let next_contexts = next_contexts
+        let mut next_contexts = next_contexts
             .into_iter()
             .flat_map(|page| {
+                let next_page_url = page
+                    .next_page_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .map(page_url_to_uri);
+
                 if !page.tracks.is_empty() {
                     self.fill_context_from_page(page).ok()?;
-                    None
+                    next_page_url
                 } else if matches!(page.page_url, Some(ref url) if !url.is_empty()) {
                     Some(page_url_to_uri(
                         &page.page_url.expect("checked by precondition"),
@@ -292,7 +341,12 @@ impl ConnectState {
                     None
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        if let Some(next_page_url) = first_page_next_page_url {
+            info!("[DJDBG] preserving context continuation cursor: {next_page_url}");
+            next_contexts.push(next_page_url);
+        }
 
         Ok(Some(next_contexts))
     }
@@ -445,12 +499,25 @@ impl ConnectState {
         page_metadata: Option<&HashMap<String, String>>,
         provider: Option<Provider>,
     ) -> Result<ProvidedTrack, Error> {
-        let id = match (ctx_track.uri.as_ref(), ctx_track.gid.as_ref()) {
-            (Some(uri), _) if uri.contains(['?']) => {
+        let canonical_uri = ctx_track
+            .metadata
+            .get("canonical_track_uri")
+            .filter(|uri| !uri.is_empty());
+
+        let id = match (
+            ctx_track.uri.as_ref(),
+            canonical_uri,
+            ctx_track.gid.as_ref(),
+        ) {
+            (Some(uri), _, _) if uri.contains(['?']) => {
                 Err(StateError::InvalidTrackUri(Some(uri.clone())))?
             }
-            (Some(uri), _) if !uri.is_empty() => SpotifyUri::from_uri(uri)?,
-            (_, Some(gid)) if !gid.is_empty() => SpotifyUri::Track {
+            (Some(uri), _, _) if !uri.is_empty() => SpotifyUri::from_uri(uri)?,
+            (_, Some(uri), _) if uri.contains(['?']) => {
+                Err(StateError::InvalidTrackUri(Some(uri.clone())))?
+            }
+            (_, Some(uri), _) => SpotifyUri::from_uri(uri)?,
+            (_, _, Some(gid)) if !gid.is_empty() => SpotifyUri::Track {
                 id: SpotifyId::from_raw(gid)?,
             },
             _ => Err(StateError::InvalidTrackUri(None))?,
@@ -516,5 +583,24 @@ impl ConnectState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_url_to_uri;
+
+    #[test]
+    fn keeps_lexicon_pagination_cursor_opaque() {
+        let cursor = "hm://lexicon-session-provider/context-resolve/v2/session/abc?requestId=1";
+        assert_eq!(page_url_to_uri(cursor), cursor);
+    }
+
+    #[test]
+    fn still_converts_regular_context_page_urls() {
+        assert_eq!(
+            page_url_to_uri("hm://artistplaycontext/v1/page/spotify/album/abc/km_artist"),
+            "spotify:album:abc"
+        );
     }
 }

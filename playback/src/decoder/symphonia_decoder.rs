@@ -18,6 +18,7 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    channels: usize,
 }
 
 #[derive(Default)]
@@ -33,6 +34,25 @@ pub(crate) struct LocalFileMetadata {
 
 impl SymphoniaDecoder {
     pub fn new<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::new_inner(input, hint, false)
+    }
+
+    /// Creates a decoder for DJ narration clips.
+    ///
+    /// Spotify's TTS service returns mono MP3 clips, while regular librespot
+    /// playback requires stereo samples. Narration is the only path that is
+    /// allowed to accept mono; samples are upmixed to stereo in `next_packet`.
+    pub(crate) fn new_narration<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::new_inner(input, hint, true)
+    }
+
+    fn new_inner<R>(input: R, hint: Hint, allow_mono: bool) -> DecoderResult<Self>
     where
         R: MediaSource + 'static,
     {
@@ -77,7 +97,8 @@ impl SymphoniaDecoder {
         let channels = decoder.codec_params().channels.ok_or_else(|| {
             DecoderError::SymphoniaDecoder("Could not retrieve channel configuration".into())
         })?;
-        if channels.count() != NUM_CHANNELS as usize {
+        let channel_count = channels.count();
+        if channel_count != NUM_CHANNELS as usize && !(allow_mono && channel_count == 1) {
             return Err(DecoderError::SymphoniaDecoder(format!(
                 "Unsupported number of channels: {channels}"
             )));
@@ -89,6 +110,7 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            channels: channel_count,
         })
     }
 
@@ -114,6 +136,16 @@ impl SymphoniaDecoder {
             }
 
             Some(data)
+        }
+    }
+
+    pub(crate) fn duration_ms(&self) -> u32 {
+        let codec_params = self.decoder.codec_params();
+        match (codec_params.time_base, codec_params.n_frames) {
+            (Some(time_base), Some(n_frames)) => {
+                Duration::from(time_base.calc_time(n_frames)).as_millis() as u32
+            }
+            _ => 0,
         }
     }
 
@@ -253,7 +285,11 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
+                    let samples = if self.channels == 1 {
+                        AudioPacket::Samples(upmix_mono_to_stereo(sample_buffer.samples()))
+                    } else {
+                        AudioPacket::Samples(sample_buffer.samples().to_vec())
+                    };
 
                     return Ok(Some((packet_position, samples)));
                 }
@@ -267,5 +303,32 @@ impl AudioDecoder for SymphoniaDecoder {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+}
+
+fn upmix_mono_to_stereo(samples: &[f64]) -> Vec<f64> {
+    let mut stereo = Vec::with_capacity(samples.len().saturating_mul(2));
+    for &sample in samples {
+        stereo.push(sample);
+        stereo.push(sample);
+    }
+    stereo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upmix_mono_to_stereo;
+
+    #[test]
+    fn upmixes_mono_samples_by_duplication() {
+        assert_eq!(
+            upmix_mono_to_stereo(&[0.25, -0.5]),
+            vec![0.25, 0.25, -0.5, -0.5]
+        );
+    }
+
+    #[test]
+    fn upmixes_empty_samples() {
+        assert!(upmix_mono_to_stereo(&[]).is_empty());
     }
 }

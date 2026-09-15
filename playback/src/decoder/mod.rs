@@ -77,6 +77,14 @@ impl Deref for AudioPacketPosition {
 pub trait AudioDecoder {
     fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError>;
     fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>>;
+
+    /// Returns the logical narration segment at a composed stream position.
+    /// Regular track decoders do not have narration segments, so they keep the
+    /// default `None` implementation.  The player uses this optional signal
+    /// for presentation only; it never changes the track identity or queue.
+    fn narration_phase(&self, _position_ms: u32) -> Option<crate::narration::NarrationPhase> {
+        None
+    }
 }
 
 impl From<DecoderError> for librespot_core::error::Error {

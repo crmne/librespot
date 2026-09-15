@@ -12,15 +12,18 @@ use crate::{
     error::ErrorKind,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
+        client_tts::{TtsRequest, TtsResponse},
         clienttoken_http::{
             ChallengeAnswer, ChallengeType, ClientTokenRequest, ClientTokenRequestType,
             ClientTokenResponse, ClientTokenResponseType,
         },
         connect::PutStateRequest,
         context::Context,
+        context_page::ContextPage,
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
+        tts_resolve::resolve_request,
     },
     token::Token,
     util,
@@ -29,7 +32,11 @@ use crate::{
 use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
-use http::{Uri, header::HeaderValue};
+use http::{
+    StatusCode, Uri,
+    header::{HeaderValue, LOCATION},
+};
+use http_body_util::BodyExt;
 use hyper::{
     HeaderMap, Method, Request,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
@@ -911,6 +918,151 @@ impl SpClient {
         Ok(ctx?)
     }
 
+    /// Resolve a DJ narration prompt into a signed audio URL.
+    ///
+    /// Spotify's narration service currently answers with a redirect whose
+    /// `Location` header is the signed clip URL.  Some access points return a
+    /// protobuf body instead, so both forms are accepted here.  The signed URL
+    /// is intentionally returned to the caller; fetching it does not require
+    /// Spotify authentication headers.
+    pub async fn get_tts_url(
+        &self,
+        ssml: &str,
+        language: &str,
+        voice: u32,
+        provider: u32,
+    ) -> Result<String, Error> {
+        if ssml.trim().is_empty() {
+            return Err(SpClientError::Attribute("narration SSML".to_string()).into());
+        }
+
+        let mut message = TtsRequest::new();
+        message.audio_format = resolve_request::AudioFormat::MP3.into();
+        message.language = language.to_string();
+        message.tts_voice = protobuf::EnumOrUnknown::from_i32(voice as i32);
+        message.tts_provider = protobuf::EnumOrUnknown::from_i32(provider as i32);
+        message.sample_rate_hz = 44_100;
+        message.set_ssml(ssml.to_string());
+        let body = message.write_to_bytes()?;
+
+        let mut url = self.base_url().await?;
+        url.push_str("/client-tts/v1/fulfill");
+
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-protobuf"),
+            )
+            .header(ACCEPT, HeaderValue::from_static("application/x-protobuf"))
+            .header(CONTENT_LENGTH, body.len())
+            .body(body.into())?;
+
+        let token = self.session().login5().auth_token().await?;
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token))?,
+        );
+        if let Ok(client_token) = self.client_token().await {
+            request
+                .headers_mut()
+                .insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+        }
+
+        let response = self
+            .session()
+            .http_client()
+            .request_no_redirect(request)
+            .await?;
+
+        info!(
+            "[DJDBG] TTS resolver responded with HTTP {}",
+            response.status()
+        );
+
+        if matches!(
+            response.status(),
+            StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .ok_or_else(|| SpClientError::NoData)?
+                .to_str()?
+                .to_string();
+            if location.is_empty() {
+                return Err(SpClientError::NoData.into());
+            }
+            return Ok(location);
+        }
+
+        if response.status().is_success() {
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let response = TtsResponse::parse_from_bytes(&bytes)?;
+            if !response.url.is_empty() {
+                return Ok(response.url);
+            }
+            return Err(SpClientError::NoData.into());
+        }
+
+        Err(Error::failed_precondition(format!(
+            "TTS resolver returned HTTP {}",
+            response.status()
+        )))
+    }
+
+    /// Resolve a context through a Spotify `hm://` URL embedded in a payload.
+    ///
+    /// These URLs name an HTTP SpClient endpoint; they are not Mercury URIs.
+    /// Keep the query string verbatim because contextUri values contain
+    /// unescaped Spotify URI separators such as `:`.
+    pub async fn get_context_from_hm_url(&self, hm_url: &str) -> Result<Context, Error> {
+        let endpoint = hm_url_to_endpoint(hm_url)?;
+        let res = self
+            .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+            .await?;
+        let ctx_json = String::from_utf8(res.to_vec())?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+
+        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
+
+        if ctx.is_err() {
+            trace!("failed parsing hm context: {ctx_json}");
+        }
+
+        Ok(ctx?)
+    }
+
+    /// Resolve a Lexicon pagination cursor through its `hm://` URL.
+    ///
+    /// Unlike a session/context URL, `next_page_url` endpoints return a single
+    /// `ContextPage` JSON object. Keeping this parser separate prevents a page
+    /// response from being mistaken for an empty `Context`.
+    pub async fn get_context_page_from_hm_url(&self, hm_url: &str) -> Result<ContextPage, Error> {
+        let endpoint = hm_url_to_endpoint(hm_url)?;
+        let res = self
+            .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+            .await?;
+        let ctx_json = String::from_utf8(res.to_vec())?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+
+        let page = protobuf_json_mapping::parse_from_str::<ContextPage>(&ctx_json);
+
+        if page.is_err() {
+            trace!("failed parsing hm context page: {ctx_json}");
+        }
+
+        Ok(page?)
+    }
+
     pub async fn get_autoplay_context(
         &self,
         context_request: &AutoplayContextRequest,
@@ -974,6 +1126,19 @@ impl SpClient {
     }
 }
 
+fn hm_url_to_endpoint(hm_url: &str) -> Result<String, Error> {
+    let remainder = hm_url
+        .strip_prefix("hm://")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::failed_precondition(format!("invalid hm url: {hm_url}")))?;
+
+    Ok(if remainder.starts_with('/') {
+        remainder.to_owned()
+    } else {
+        format!("/{remainder}")
+    })
+}
+
 fn playlist_range_endpoint(
     playlist_id: &SpotifyId,
     from: usize,
@@ -1002,5 +1167,22 @@ mod tests {
                 .ends_with("&from=0&length=0"),
             "the header alone"
         );
+    }
+
+    #[test]
+    fn hm_url_conversion_preserves_path_and_raw_query() {
+        assert_eq!(
+            hm_url_to_endpoint(
+                "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq&reason=state_restore"
+            )
+            .unwrap(),
+            "/lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq&reason=state_restore"
+        );
+    }
+
+    #[test]
+    fn hm_url_conversion_rejects_non_hm_urls() {
+        assert!(hm_url_to_endpoint("https://example.test/context").is_err());
+        assert!(hm_url_to_endpoint("hm://").is_err());
     }
 }
