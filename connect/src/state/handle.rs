@@ -10,6 +10,11 @@ use protobuf::MessageField;
 
 impl ConnectState {
     pub fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
+        if self.is_dj_context() {
+            debug!("shuffle is not supported in DJ context, ignoring toggle");
+            return Ok(());
+        }
+
         self.set_shuffle(shuffle);
 
         if shuffle {

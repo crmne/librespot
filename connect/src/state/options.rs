@@ -51,6 +51,10 @@ impl ConnectState {
     }
 
     fn validate_shuffle_allowed(&self) -> Result<(), Error> {
+        if self.is_dj_context() {
+            return Ok(());
+        }
+
         if let Some(reason) = self
             .player()
             .restrictions

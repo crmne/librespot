@@ -151,7 +151,16 @@ impl ConnectState {
     ) -> Option<&'s str> {
         context_uri
             .and_then(Self::valid_resolve_uri)
-            .or_else(|| first_page.and_then(|p| p.tracks.first().and_then(|t| t.uri.as_deref())))
+            .or_else(|| {
+                first_page.and_then(|p| {
+                    p.tracks.first().and_then(|t| {
+                        t.uri
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| t.metadata.get("canonical_track_uri").map(|s| s.as_str()))
+                    })
+                })
+            })
     }
 
     pub fn set_active_context(&mut self, new_context: ContextType) {
@@ -183,6 +192,14 @@ impl ConnectState {
         for (key, value) in metadata {
             player.context_metadata.insert(key, value);
         }
+        let is_dj = player.context_uri.contains("37i9dQZF1EYkqdzj48dyYq")
+            || player.context_metadata.get("lexicon_set_type").map(|s| s.as_str()) == Some("your_dj")
+            || player.context_metadata.get("context_description").map(|s| s.as_str()) == Some("DJ");
+        if is_dj {
+            player
+                .context_metadata
+                .insert("dj.interactivity_enabled".into(), "true".into());
+        }
     }
 
     pub fn update_context(
@@ -190,9 +207,43 @@ impl ConnectState {
         mut context: Context,
         ty: ContextType,
     ) -> Result<Option<Vec<String>>, Error> {
+        let is_dj_context = context.metadata.get("lexicon_set_type").map(|s| s.as_str()) == Some("your_dj")
+            || context.metadata.get("context_description").map(|s| s.as_str()) == Some("DJ")
+            || matches!(context.uri, Some(ref uri) if uri.contains("37i9dQZF1EYkqdzj48dyYq"));
+
         if context.pages.iter().all(|p| p.tracks.is_empty()) {
-            error!("context didn't have any tracks: {context:#?}");
-            Err(StateError::ContextHasNoTracks)?;
+            if is_dj_context {
+                debug!("handling DJ context with empty initial tracks");
+                let mut tracks = Vec::new();
+                if let Some(ref current) = self.player().track.as_ref() {
+                    let mut ct = ContextTrack::default();
+                    ct.uri = Some(current.uri.clone());
+                    ct.uid = Some(current.uid.clone());
+                    ct.metadata = current.metadata.clone();
+                    tracks.push(ct);
+                }
+                for next in &self.player().next_tracks {
+                    let mut ct = ContextTrack::default();
+                    ct.uri = Some(next.uri.clone());
+                    ct.uid = Some(next.uid.clone());
+                    ct.metadata = next.metadata.clone();
+                    tracks.push(ct);
+                }
+                if tracks.is_empty() {
+                    let mut ct = ContextTrack::default();
+                    if let Some(ref uri) = context.uri {
+                        ct.uri = Some(uri.clone());
+                    }
+                    tracks.push(ct);
+                }
+                if context.pages.is_empty() {
+                    context.pages.push(ContextPage::default());
+                }
+                context.pages[0].tracks = tracks;
+            } else {
+                error!("context didn't have any tracks: {context:#?}");
+                Err(StateError::ContextHasNoTracks)?;
+            }
         } else if matches!(context.uri, Some(ref uri) if uri.starts_with(LOCAL_FILES_IDENTIFIER)) {
             Err(StateError::UnsupportedLocalPlayback)?;
         }
@@ -247,7 +298,9 @@ impl ConnectState {
                         if let Ok(autoplay_ctx) = self.get_context_mut(ContextType::Autoplay) {
                             autoplay_ctx.index.track = 0
                         }
-                        self.clear_next_tracks();
+                        if !is_dj_context {
+                            self.clear_next_tracks();
+                        }
                     }
                 }
 
@@ -259,6 +312,12 @@ impl ConnectState {
                     self.player_mut().context_url.clear()
                 }
                 self.player_mut().context_uri = context.uri.take().unwrap_or_default();
+
+                if is_dj_context {
+                    self.player_mut()
+                        .context_metadata
+                        .insert("dj.interactivity_enabled".into(), "true".into());
+                }
             }
             ContextType::Autoplay => {
                 self.autoplay_context = Some(self.state_context_from_page(
@@ -445,14 +504,26 @@ impl ConnectState {
         page_metadata: Option<&HashMap<String, String>>,
         provider: Option<Provider>,
     ) -> Result<ProvidedTrack, Error> {
-        let id = match (ctx_track.uri.as_ref(), ctx_track.gid.as_ref()) {
-            (Some(uri), _) if uri.contains(['?']) => {
-                Err(StateError::InvalidTrackUri(Some(uri.clone())))?
+        let canonical_uri = ctx_track
+            .metadata
+            .get("canonical_track_uri")
+            .map(|s| s.split('?').next().unwrap_or(s))
+            .filter(|s| !s.is_empty());
+
+        let id = match (
+            ctx_track.uri.as_ref().filter(|s| !s.is_empty()),
+            ctx_track.gid.as_ref().filter(|s| !s.is_empty()),
+            canonical_uri,
+        ) {
+            (Some(uri), _, _) if uri.contains(['?']) => {
+                let clean_uri = uri.split('?').next().unwrap_or(uri);
+                SpotifyUri::from_uri(clean_uri)?
             }
-            (Some(uri), _) if !uri.is_empty() => SpotifyUri::from_uri(uri)?,
-            (_, Some(gid)) if !gid.is_empty() => SpotifyUri::Track {
+            (Some(uri), _, _) => SpotifyUri::from_uri(uri)?,
+            (_, Some(gid), _) => SpotifyUri::Track {
                 id: SpotifyId::from_raw(gid)?,
             },
+            (_, _, Some(uri)) => SpotifyUri::from_uri(uri)?,
             _ => Err(StateError::InvalidTrackUri(None))?,
         };
 
