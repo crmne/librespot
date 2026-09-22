@@ -180,7 +180,7 @@ impl From<StateError> for Error {
 }
 
 /// Configuration of the connect device
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectConfig {
     /// The name of the connect device (default: librespot)
     pub name: String,
@@ -194,6 +194,22 @@ pub struct ConnectConfig {
     pub disable_volume: bool,
     /// Number of incremental steps (default: 64)
     pub volume_steps: u16,
+    /// Optional handler for track narration metadata in DJ contexts
+    pub narration_handler: Option<std::sync::Arc<dyn Fn(String, std::collections::HashMap<String, String>) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("name", &self.name)
+            .field("device_type", &self.device_type)
+            .field("is_group", &self.is_group)
+            .field("initial_volume", &self.initial_volume)
+            .field("disable_volume", &self.disable_volume)
+            .field("volume_steps", &self.volume_steps)
+            .field("has_narration_handler", &self.narration_handler.is_some())
+            .finish()
+    }
 }
 
 impl Default for ConnectConfig {
@@ -205,6 +221,7 @@ impl Default for ConnectConfig {
             initial_volume: u16::MAX / 2,
             disable_volume: false,
             volume_steps: 64,
+            narration_handler: None,
         }
     }
 }
@@ -291,15 +308,14 @@ impl ConnectState {
                 supports_command_request: true,
                 supports_set_options_command: true,
 
-                is_voice_enabled: false,
+                is_voice_enabled: true,
                 restrict_to_local: false,
                 connect_disabled: false,
                 supports_rename: false,
                 supports_external_episodes: false,
-                supports_set_backend_metadata: false,
+                supports_set_backend_metadata: true,
                 supports_hifi: MessageField::none(),
-                // that "AI" dj thingy only available to specific regions/users
-                supports_dj: false,
+                supports_dj: true,
                 supports_rooms: false,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
@@ -373,6 +389,12 @@ impl ConnectState {
 
     pub fn player(&self) -> &PlayerState {
         &self.request.device.player_state
+    }
+
+    pub fn is_dj_context(&self) -> bool {
+        self.context_uri().contains("37i9dQZF1EYkqdzj48dyYq")
+            || self.player().context_metadata.get("lexicon_set_type").map(|s| s.as_str()) == Some("your_dj")
+            || self.player().context_metadata.get("context_description").map(|s| s.as_str()) == Some("DJ")
     }
 
     pub fn is_active(&self) -> bool {

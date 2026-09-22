@@ -110,6 +110,7 @@ struct SpircTask {
     update_state: bool,
 
     spirc_id: usize,
+    narration_handler: Option<std::sync::Arc<dyn Fn(String, std::collections::HashMap<String, String>) + Send + Sync>>,
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -233,6 +234,7 @@ impl Spirc {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
+        let narration_handler = config.narration_handler.clone();
         let connect_state = ConnectState::new(config, &session);
 
         let connection_id_update = session
@@ -319,6 +321,7 @@ impl Spirc {
             update_state: false,
 
             spirc_id,
+            narration_handler,
         };
 
         let spirc = Spirc {
@@ -1049,9 +1052,31 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
+                self.player.stop();
                 self.handle_disconnect().await?;
-                self.handle_stop();
             } else if self.connect_state.is_active() {
+                if let Some(ref player_state) = cluster.player_state.as_ref() {
+                    let is_dj = player_state.context_uri.contains("37i9dQZF1EYkqdzj48dyYq")
+                        || player_state.context_metadata.get("lexicon_set_type").map(|s| s.as_str()) == Some("your_dj")
+                        || self.connect_state.is_dj_context();
+                    if is_dj && !player_state.next_tracks.is_empty() {
+                        let mut next_tracks = player_state.next_tracks.clone();
+                        next_tracks.retain(|t| {
+                            t.uri != "spotify:delimiter"
+                                && t.metadata
+                                    .get("canonical_track_uri")
+                                    .map_or(true, |c| !c.contains("delimiter"))
+                        });
+                        for t in &mut next_tracks {
+                            if t.uri.is_empty() {
+                                if let Some(canonical) = t.metadata.get("canonical_track_uri") {
+                                    t.uri = canonical.split('?').next().unwrap_or(canonical).to_string();
+                                }
+                            }
+                        }
+                        self.connect_state.set_next_tracks(next_tracks);
+                    }
+                }
                 // fixme: workaround fix, because of missing information why it behaves like it does
                 //  background: when another device sends a connect-state update, some player's position de-syncs
                 //  tried: providing session_id, playback_id, track-metadata "track_player"
@@ -1132,7 +1157,11 @@ impl SpircTask {
                             .iter()
                             .cloned()
                             .flat_map(|p| p.tracks)
-                            .flat_map(|t| t.uri)
+                            .flat_map(|t| {
+                                t.uri
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| t.metadata.get("canonical_track_uri").cloned())
+                            })
                             .collect(),
                     ),
                     None => Err(SpircError::NoUri("context"))?,
@@ -1332,9 +1361,10 @@ impl SpircTask {
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
 
+        let current_pos = self.position();
+        self.connect_state.update_position(current_pos, self.now_ms());
         self.play_status = SpircPlayStatus::Stopped {};
-        self.connect_state
-            .update_position_in_relation(self.now_ms());
+        self.connect_state.set_status(&self.play_status);
         self.notify().await?;
 
         self.connect_state.became_inactive(&self.session).await?;
@@ -1692,6 +1722,10 @@ impl SpircTask {
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
+        if self.connect_state.is_dj_context() {
+            return;
+        }
+
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
@@ -1904,7 +1938,16 @@ impl SpircTask {
         }
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
-        let id = SpotifyUri::from_uri(current_uri)?;
+        if let Some(ref handler) = self.narration_handler {
+            let metadata = self.connect_state.current_track(|t| t.metadata.clone());
+            if position_ms == 0 {
+                (handler)(current_uri.to_string(), metadata);
+            } else {
+                (handler)(current_uri.to_string(), std::collections::HashMap::new());
+            }
+        }
+        let clean_uri = current_uri.split('?').next().unwrap_or(current_uri);
+        let id = SpotifyUri::from_uri(clean_uri)?;
         self.player.load(id, start_playing, position_ms);
 
         self.connect_state

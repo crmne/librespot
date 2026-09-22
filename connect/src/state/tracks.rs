@@ -253,7 +253,13 @@ impl<'ct> ConnectState {
         tracks
             .iter_mut()
             .filter(|t| t.uri.is_empty())
-            .for_each(|t| t.uri = self.current_track(|ct| ct.uri.clone()));
+            .for_each(|t| {
+                if let Some(canonical) = t.metadata.get("canonical_track_uri") {
+                    t.uri = canonical.split('?').next().unwrap_or(canonical).to_string();
+                } else {
+                    t.uri = self.current_track(|ct| ct.uri.clone());
+                }
+            });
 
         self.player_mut().next_tracks = tracks;
     }

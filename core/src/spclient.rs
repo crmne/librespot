@@ -892,17 +892,85 @@ impl SpClient {
     ///   - the query result shown by the search expects no query at all
     ///   - uri looks like `spotify:search:never+gonna`
     pub async fn get_context(&self, uri: &str) -> Result<Context, Error> {
-        let uri = format!("/context-resolve/v1/{uri}");
+        const IGNORE_UNKNOWN: protobuf_json_mapping::ParseOptions = protobuf_json_mapping::ParseOptions {
+            ignore_unknown_fields: true,
+            _future_options: (),
+        };
+
+        let is_dj = uri.contains("37i9dQZF1EYkqdzj48dyYq") || uri.contains("your_dj");
+        if is_dj {
+            let encoded_uri = form_urlencoded::byte_serialize(uri.as_bytes()).collect::<String>();
+            let endpoint = format!(
+                "/lexicon-session-provider/context-resolve/v2/session?contextUri={encoded_uri}&reason=state_restore"
+            );
+            debug!("requesting DJ session from lexicon: {endpoint}");
+            if let Ok(res) = self
+                .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+                .await
+            {
+                if let Ok(ctx_json) = String::from_utf8(res.to_vec()) {
+                    if !ctx_json.is_empty() {
+                        if let Ok(mut ctx) = protobuf_json_mapping::parse_from_str_with_options::<Context>(
+                            &ctx_json,
+                            &IGNORE_UNKNOWN,
+                        ) {
+                            if ctx.uri.is_none() {
+                                ctx.uri = Some(uri.to_string());
+                            }
+                            if ctx.url.is_none() {
+                                ctx.url = Some(format!("context://{uri}"));
+                            }
+                            // Sanitize tracks: filter out delimiter tracks and fix up empty URIs
+                            for page in &mut ctx.pages {
+                                page.tracks.retain(|t| {
+                                    if let Some(ref u) = t.uri {
+                                        u != "spotify:delimiter" && !u.is_empty()
+                                    } else {
+                                        t.metadata.contains_key("canonical_track_uri")
+                                    }
+                                });
+                                for t in &mut page.tracks {
+                                    if t.uri.as_ref().map_or(true, |u| u.is_empty()) {
+                                        if let Some(canonical) = t.metadata.get("canonical_track_uri") {
+                                            t.uri = Some(
+                                                canonical
+                                                    .split('?')
+                                                    .next()
+                                                    .unwrap_or(canonical)
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            let track_count = ctx.pages.iter().map(|p| p.tracks.len()).sum::<usize>();
+                            if track_count > 0 {
+                                info!(
+                                    "lexicon: successfully resolved {track_count} DJ tracks for {uri}"
+                                );
+                                return Ok(ctx);
+                            }
+                        } else {
+                            warn!("failed to parse lexicon DJ response: {ctx_json}");
+                        }
+                    }
+                }
+            } else {
+                warn!("lexicon context resolve request failed for {uri}");
+            }
+        }
+
+        let endpoint_uri = format!("/context-resolve/v1/{uri}");
 
         let res = self
-            .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
+            .request_with_options(&Method::GET, &endpoint_uri, None, None, &NO_METRICS_AND_SALT)
             .await?;
         let ctx_json = String::from_utf8(res.to_vec())?;
         if ctx_json.is_empty() {
             Err(SpClientError::NoData)?
         }
 
-        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
+        let ctx = protobuf_json_mapping::parse_from_str_with_options::<Context>(&ctx_json, &IGNORE_UNKNOWN);
 
         if ctx.is_err() {
             trace!("failed parsing context: {ctx_json}")
