@@ -9,6 +9,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -149,6 +150,8 @@ pub struct SetOptionsCommand {
     pub shuffling_context: Option<bool>,
     pub repeating_context: Option<bool>,
     pub repeating_track: Option<bool>,
+    #[serde(default)]
+    pub modes: HashMap<String, String>,
     pub options: Option<OptionsOptions>,
     pub logging_params: LoggingParams,
 }
@@ -214,4 +217,24 @@ pub struct LoggingParams {
     pub command_initiated_time: Option<i64>,
     pub page_instance_ids: Option<Vec<String>>,
     pub command_id: Option<String>,
+}
+
+#[cfg(test)]
+mod jam_tests {
+    use super::*;
+
+    #[test]
+    fn set_options_reads_a_jam_mode_without_other_options() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "endpoint": "set_options",
+            "modes": {"jam": "off"},
+            "logging_params": {}
+        }))
+        .unwrap();
+        let Command::SetOptions(options) = command else {
+            panic!("expected set_options");
+        };
+        assert_eq!(options.modes.get("jam"), Some(&"off".into()));
+        assert_eq!(options.repeating_context, None);
+    }
 }

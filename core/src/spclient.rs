@@ -12,15 +12,18 @@ use crate::{
     error::ErrorKind,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
+        client_tts::{TtsRequest, tts_request},
         clienttoken_http::{
             ChallengeAnswer, ChallengeType, ClientTokenRequest, ClientTokenRequestType,
             ClientTokenResponse, ClientTokenResponseType,
         },
         connect::PutStateRequest,
         context::Context,
+        context_page::ContextPage,
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
+        tts_resolve::resolve_request::{AudioFormat, TtsProvider, TtsVoice},
     },
     token::Token,
     util,
@@ -32,7 +35,7 @@ use futures_util::future::IntoStream;
 use http::{Uri, header::HeaderValue};
 use hyper::{
     HeaderMap, Method, Request,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, LOCATION, RANGE},
 };
 use hyper_util::client::legacy::ResponseFuture;
 use protobuf::{Enum, EnumOrUnknown, Message, MessageFull};
@@ -70,6 +73,8 @@ pub enum SpClientError {
     NoData,
     #[error("expected an entry to exist in {0}")]
     ExpectedEntry(&'static str),
+    #[error("unsupported context URL")]
+    UnsupportedContextUrl,
 }
 
 impl From<SpClientError> for Error {
@@ -909,6 +914,104 @@ impl SpClient {
         }
 
         Ok(ctx?)
+    }
+
+    /// Resolve a DJ context or page through the URL supplied by Spotify's
+    /// Connect state. The regular context URI yields an empty placeholder.
+    async fn get_lexicon_context<T: MessageFull>(&self, url: &str) -> Result<T, Error> {
+        const PREFIX: &str = "hm://lexicon-session-provider/";
+        let path = url
+            .strip_prefix(PREFIX)
+            .filter(|path| !path.is_empty() && !path.contains(".."))
+            .ok_or(SpClientError::UnsupportedContextUrl)?;
+        let endpoint = format!("/lexicon-session-provider/{path}");
+        let bytes = self
+            .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+            .await?;
+        if bytes.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+        let json = std::str::from_utf8(&bytes)?;
+        Ok(protobuf_json_mapping::parse_from_str::<T>(json)?)
+    }
+
+    pub async fn get_context_url(&self, url: &str) -> Result<Context, Error> {
+        self.get_lexicon_context(url).await
+    }
+
+    pub async fn get_context_page_url(&self, url: &str) -> Result<ContextPage, Error> {
+        self.get_lexicon_context(url).await
+    }
+
+    /// Render a DJ line using the script and voice supplied by its context.
+    /// The response redirects to a short-lived MP3 on Spotify's TTS CDN.
+    pub async fn get_narration_audio(
+        &self,
+        ssml: &str,
+        voice: &str,
+        provider: &str,
+    ) -> Result<Bytes, Error> {
+        let request = TtsRequest {
+            audio_format: EnumOrUnknown::new(AudioFormat::MP3),
+            tts_voice: EnumOrUnknown::new(TtsVoice::from_str(voice).unwrap_or(TtsVoice::VOICE1)),
+            tts_provider: EnumOrUnknown::new(
+                TtsProvider::from_str(provider).unwrap_or(TtsProvider::SONANTIC_FAST),
+            ),
+            sample_rate_hz: 44_100,
+            prompt: Some(tts_request::Prompt::Ssml(ssml.to_owned())),
+            ..Default::default()
+        };
+        let body = request.write_to_bytes()?;
+        let token = self.session().login5().auth_token().await?;
+        let url = format!("{}/client-tts/v1/fulfill", self.base_url().await?);
+        let response = self
+            .session()
+            .http_client()
+            .request_fut(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/x-protobuf")
+                    .header(
+                        AUTHORIZATION,
+                        format!("{} {}", token.token_type, token.access_token),
+                    )
+                    .header(CLIENT_TOKEN, self.client_token().await?)
+                    .body(Bytes::from(body))?,
+            )?
+            .await?;
+        if response.status() != hyper::StatusCode::SEE_OTHER
+            && response.status() != hyper::StatusCode::FOUND
+        {
+            return Err(Error::unavailable(format!(
+                "DJ narration returned {}",
+                response.status()
+            )));
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| Error::unavailable("DJ narration response had no location"))?;
+        if !location.starts_with("https://tts.spotifycdn.com/") {
+            return Err(Error::invalid_argument(
+                "DJ narration redirected outside Spotify TTS",
+            ));
+        }
+        let audio = self
+            .session()
+            .http_client()
+            .request_body(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(location)
+                    .body(Bytes::new())?,
+            )
+            .await?;
+        if audio.len() > 4 * 1024 * 1024 {
+            return Err(Error::out_of_range("DJ narration audio exceeds 4 MiB"));
+        }
+        Ok(audio)
     }
 
     pub async fn get_autoplay_context(

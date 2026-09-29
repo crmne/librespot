@@ -14,12 +14,13 @@ use crate::{
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        player::{DjNarration, Player, PlayerEvent, PlayerEventChannel},
     },
     protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
+        player::ProvidedTrack,
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -139,6 +140,85 @@ enum SpircCommand {
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
+
+/// A Jam's collaborative list can be refused by context-resolve even though
+/// the Connect transfer carries its tracks. Use the embedded page, or the
+/// currently playing track when the page is absent; the queue is separate in
+/// the transfer and is restored by `finish_transfer`.
+fn embedded_jam_context(transfer: &TransferState) -> Option<Context> {
+    let mut context = transfer.current_session.context.as_ref()?.clone();
+    if !context
+        .uri
+        .as_deref()?
+        .starts_with("spotify:list:jam-list:")
+    {
+        return None;
+    }
+    if context.pages.iter().all(|page| page.tracks.is_empty()) {
+        let current = transfer.playback.current_track.as_ref()?.clone();
+        if current.uri.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        context.pages = vec![ContextPage {
+            tracks: vec![current],
+            ..Default::default()
+        }];
+    }
+    Some(context)
+}
+
+fn transfer_initial_track(
+    state: &ConnectState,
+    transfer: &TransferState,
+    embedded_jam: Option<&Context>,
+) -> Result<ProvidedTrack, Error> {
+    let missing = match state.current_track_from_transfer(transfer) {
+        Ok(track) => return Ok(track),
+        Err(error) => error,
+    };
+    // A Jam can hand over its list without naming a current track, for
+    // example at the end of a previous session. Start at the first row.
+    let Some(context) = embedded_jam else {
+        return Err(missing);
+    };
+    let Some((track, metadata)) = context
+        .pages
+        .iter()
+        .find_map(|page| page.tracks.first().map(|track| (track, &page.metadata)))
+    else {
+        return Err(missing);
+    };
+    state.context_to_provided_track(track, context.uri.as_deref(), Some(0), Some(metadata), None)
+}
+
+/// Social Connect sends a transfer for each Jam edit. It may retain the
+/// original stream only when the same occurrence of the same song is playing.
+fn transfer_continues(
+    transfer: &TransferState,
+    retain_original: bool,
+    state: &ConnectState,
+    status: &SpircPlayStatus,
+) -> bool {
+    if !retain_original
+        || !state.is_active()
+        || !matches!(
+            status,
+            SpircPlayStatus::Playing { .. } | SpircPlayStatus::Paused { .. }
+        )
+    {
+        return false;
+    }
+    let Some(track) = transfer.playback.current_track.as_ref() else {
+        return false;
+    };
+    let Some(current) = state.current_track(|track| track.as_ref().cloned()) else {
+        return false;
+    };
+    track.uri.as_deref() == Some(current.uri.as_str())
+        && (track.uid.as_deref().is_none_or(str::is_empty)
+            || current.uid.is_empty()
+            || track.uid.as_deref() == Some(current.uid.as_str()))
+}
 
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
@@ -982,7 +1062,7 @@ impl SpircTask {
         use protobuf::Message;
 
         match TransferState::parse_from_bytes(&cluster.transfer_data) {
-            Ok(transfer_state) => self.handle_transfer(transfer_state)?,
+            Ok(transfer_state) => self.handle_transfer(transfer_state, false)?,
             Err(why) => error!("failed to take over control: {why}"),
         }
 
@@ -1119,7 +1199,12 @@ impl SpircTask {
             }
             // modification and update of the connect_state
             Transfer(transfer) => {
-                self.handle_transfer(transfer.data.expect("by condition checked"))?;
+                let retain_original =
+                    transfer.options.retain_session.as_deref() == Some("retain_original");
+                self.handle_transfer(
+                    transfer.data.expect("by condition checked"),
+                    retain_original,
+                )?;
                 return self.notify().await;
             }
             Play(mut play) => {
@@ -1185,6 +1270,7 @@ impl SpircTask {
             AddToQueue(add_to_queue) => self.connect_state.add_to_queue(add_to_queue.track, true),
             SetQueue(set_queue) => self.connect_state.handle_set_queue(set_queue),
             SetOptions(set_options) => {
+                self.connect_state.set_modes(set_options.modes);
                 if let Some(repeat_context) = set_options.repeating_context {
                     self.handle_repeat_context(repeat_context)?
                 }
@@ -1210,7 +1296,18 @@ impl SpircTask {
         Ok(())
     }
 
-    fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+    fn handle_transfer(
+        &mut self,
+        mut transfer: TransferState,
+        retain_original: bool,
+    ) -> Result<(), Error> {
+        let continuation = transfer_continues(
+            &transfer,
+            retain_original,
+            &self.connect_state,
+            &self.play_status,
+        );
+        let embedded_jam = embedded_jam_context(&transfer);
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
@@ -1225,7 +1322,7 @@ impl SpircTask {
                 .unwrap_or(ResetContext::Completely),
         );
 
-        match self.connect_state.current_track_from_transfer(&transfer) {
+        match transfer_initial_track(&self.connect_state, &transfer, embedded_jam.as_ref()) {
             Err(why) => warn!("didn't find initial track: {why}"),
             Ok(track) => {
                 debug!("found initial track <{}>", track.uri);
@@ -1239,17 +1336,32 @@ impl SpircTask {
         }
 
         let fallback = self.connect_state.current_track(|t| &t.uri).clone();
-        let load_from_context_uri = ctx_uri.is_some();
+        let load_from_context_uri = ctx_uri.is_some() && embedded_jam.is_none();
 
         match ctx_uri {
-            Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
-                    uri.clone(),
-                    &fallback,
-                    ContextType::Default,
-                    ContextAction::Replace,
-                ));
+            Some(ref uri) if embedded_jam.is_none() => {
+                let context = &transfer.current_session.context;
+                if context.metadata.get("lexicon_set_type").map(String::as_str) == Some("your_dj")
+                    && context
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| url.starts_with("hm://lexicon-session-provider/"))
+                {
+                    self.context_resolver.add(ResolveContext::from_context(
+                        context.as_ref().expect("DJ context exists").clone(),
+                        ContextType::Default,
+                        ContextAction::Replace,
+                    ));
+                } else {
+                    self.context_resolver.add(ResolveContext::from_uri(
+                        uri.clone(),
+                        &fallback,
+                        ContextType::Default,
+                        ContextAction::Replace,
+                    ));
+                }
             }
+            Some(_) => {}
             None => {
                 let all_tracks = transfer
                     .current_session
@@ -1272,6 +1384,15 @@ impl SpircTask {
         };
 
         self.handle_activate();
+        if let Some(session_id) = transfer
+            .current_session
+            .original_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            self.session.set_session_id(session_id);
+            self.connect_state.set_session_id(session_id.to_owned());
+        }
 
         let timestamp = self.now_ms();
         let state = &mut self.connect_state;
@@ -1312,7 +1433,13 @@ impl SpircTask {
             }
         }
 
-        if load_from_context_uri {
+        if let Some(context) = embedded_jam {
+            self.context_resolver.clear();
+            let _ = self
+                .connect_state
+                .update_context(context, ContextType::Default)?;
+            self.connect_state.finish_transfer(transfer)?;
+        } else if load_from_context_uri {
             self.transfer_state = Some(transfer);
         } else {
             match self.connect_state.get_context(ContextType::Default) {
@@ -1329,7 +1456,29 @@ impl SpircTask {
             }
         }
 
-        self.load_track(is_playing, position.try_into()?)
+        let position: u32 = position.try_into()?;
+        if continuation {
+            // A Jam queue edit transfers the whole session but keeps the
+            // stream already playing. Reloading it restarts the song.
+            if is_playing {
+                self.handle_play();
+            } else {
+                self.handle_pause();
+            }
+            let now = self.now_ms();
+            match &mut self.play_status {
+                SpircPlayStatus::Playing {
+                    nominal_start_time, ..
+                } => *nominal_start_time = now - i64::from(position),
+                SpircPlayStatus::Paused { position_ms, .. } => *position_ms = position,
+                _ => {}
+            }
+            self.connect_state.update_position(position, now);
+            self.connect_state.set_status(&self.play_status);
+            Ok(())
+        } else {
+            self.load_track(is_playing, position)
+        }
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
@@ -1681,8 +1830,15 @@ impl SpircTask {
             _ => (),
         }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+        if let Some(track) = self.connect_state.preview_next_track()
+            && let Ok(track_id) = SpotifyUri::from_uri(&track.uri)
+        {
+            let narration = self
+                .context_resolver
+                .dj_active()
+                .then(|| DjNarration::from_metadata(&track.metadata))
+                .flatten();
+            self.player.preload_with_narration(track_id, narration);
         }
     }
 
@@ -1695,6 +1851,15 @@ impl SpircTask {
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
+        // DJ supplies its own next segments. The normal autoplay endpoint
+        // answers 404 for this context, so fetch the DJ page before the
+        // currently buffered segment runs out instead.
+        if self.context_resolver.dj_active() {
+            if !self.connect_state.has_next_tracks(Some(4)) {
+                self.context_resolver.add_dj_page();
+            }
+            return;
+        }
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
@@ -1908,7 +2073,16 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        let narration = self
+            .context_resolver
+            .dj_active()
+            .then(|| {
+                self.connect_state
+                    .current_track(|track| DjNarration::from_metadata(&track.metadata))
+            })
+            .flatten();
+        self.player
+            .load_with_narration(id, start_playing, position_ms, narration);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -1967,6 +2141,139 @@ impl Drop for SpircTask {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    use librespot_protocol::{
+        context_track::ContextTrack, playback::Playback, queue::Queue,
+        session::Session as PlaybackSession,
+    };
+
+    const JAM_URI: &str = "spotify:list:jam-list:163dc0978f246346e7f1d14a4dd2bb9d";
+    const TRACK_URI: &str = "spotify:track:1qDrWA6lyx8cLECdZE7TV7";
+
+    fn jam_transfer(pages: Vec<ContextPage>, current: Option<ContextTrack>) -> TransferState {
+        TransferState {
+            current_session: MessageField::some(PlaybackSession {
+                context: MessageField::some(Context {
+                    uri: Some(JAM_URI.into()),
+                    pages,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            playback: MessageField::some(Playback {
+                current_track: current.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn track(uid: &str) -> ContextTrack {
+        ContextTrack {
+            uri: Some(TRACK_URI.into()),
+            uid: Some(uid.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn jam_embedded_pages_and_current_track_bypass_private_context_resolve() {
+        let page = ContextPage {
+            tracks: vec![track("first"), track("second")],
+            ..Default::default()
+        };
+        let transfer = jam_transfer(vec![page], Some(track("first")));
+        let context = embedded_jam_context(&transfer).unwrap();
+        assert_eq!(context.uri.as_deref(), Some(JAM_URI));
+        assert_eq!(context.pages[0].tracks.len(), 2);
+
+        let transfer = jam_transfer(vec![], Some(track("first")));
+        let context = embedded_jam_context(&transfer).unwrap();
+        assert_eq!(context.pages[0].tracks, vec![track("first")]);
+        assert!(embedded_jam_context(&jam_transfer(vec![], None)).is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_jam_edit_keeps_only_the_same_track_occurrence() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        state.set_active(true);
+        state.set_track(ProvidedTrack {
+            uri: TRACK_URI.into(),
+            uid: "first".into(),
+            ..Default::default()
+        });
+        let status = SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        let same = jam_transfer(vec![], Some(track("first")));
+        assert!(transfer_continues(&same, true, &state, &status));
+        assert!(!transfer_continues(&same, false, &state, &status));
+        assert!(!transfer_continues(
+            &jam_transfer(vec![], Some(track("another"))),
+            true,
+            &state,
+            &status
+        ));
+        assert!(!transfer_continues(
+            &same,
+            true,
+            &state,
+            &SpircPlayStatus::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn jam_transfer_restores_its_embedded_queue() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        let mut transfer = jam_transfer(
+            vec![ContextPage {
+                tracks: vec![track("first")],
+                ..Default::default()
+            }],
+            Some(track("first")),
+        );
+        transfer.queue = MessageField::some(Queue {
+            tracks: vec![ContextTrack {
+                uri: Some("spotify:track:2FY7b99s15jUprqC0M5NCT".into()),
+                uid: Some("queued".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let context = embedded_jam_context(&transfer).unwrap();
+        state.set_track(state.current_track_from_transfer(&transfer).unwrap());
+        state.handle_initial_transfer(&mut transfer, Some(JAM_URI.into()));
+        state.update_context(context, ContextType::Default).unwrap();
+        state.finish_transfer(transfer).unwrap();
+        assert_eq!(state.context_uri(), JAM_URI);
+        assert_eq!(state.player().track.uri, TRACK_URI);
+        assert_eq!(
+            state.player().next_tracks[0].uri,
+            "spotify:track:2FY7b99s15jUprqC0M5NCT"
+        );
+    }
+
+    #[tokio::test]
+    async fn jam_list_without_a_current_track_starts_at_its_first_song() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        let mut transfer = jam_transfer(
+            vec![ContextPage {
+                tracks: vec![track("first"), track("second")],
+                ..Default::default()
+            }],
+            None,
+        );
+        let context = embedded_jam_context(&transfer).unwrap();
+        assert!(state.current_track_from_transfer(&transfer).is_err());
+        state.set_track(transfer_initial_track(&state, &transfer, Some(&context)).unwrap());
+        state.handle_initial_transfer(&mut transfer, Some(JAM_URI.into()));
+        state.update_context(context, ContextType::Default).unwrap();
+        state.finish_transfer(transfer).unwrap();
+        assert_eq!(state.player().track.uri, TRACK_URI);
+    }
 
     #[tokio::test]
     async fn recovery_keeps_unresolved_pages_and_rejects_another_account() {

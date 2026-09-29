@@ -25,7 +25,7 @@ use crate::{
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
     core::{Error, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator},
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, NarratedDecoder, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
@@ -104,9 +104,11 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        narration: Option<DjNarration>,
     },
     Preload {
         track_id: SpotifyUri,
+        narration: Option<DjNarration>,
     },
     Play,
     Pause,
@@ -550,15 +552,33 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_with_narration(track_id, start_playing, position_ms, None);
+    }
+
+    pub fn load_with_narration(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        narration: Option<DjNarration>,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            narration,
         });
     }
 
     pub fn preload(&self, track_id: SpotifyUri) {
-        self.command(PlayerCommand::Preload { track_id });
+        self.preload_with_narration(track_id, None);
+    }
+
+    pub fn preload_with_narration(&self, track_id: SpotifyUri, narration: Option<DjNarration>) {
+        self.command(PlayerCommand::Preload {
+            track_id,
+            narration,
+        });
     }
 
     pub fn play(&self) {
@@ -709,6 +729,44 @@ enum PlayerPreload {
 }
 
 type Decoder = Box<dyn AudioDecoder + Send>;
+
+#[derive(Clone, Debug)]
+pub struct NarrationLine {
+    ssml: String,
+    voice: String,
+    provider: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DjNarration {
+    intro: Option<NarrationLine>,
+    outro: Option<NarrationLine>,
+}
+
+impl DjNarration {
+    pub fn from_metadata(metadata: &std::collections::HashMap<String, String>) -> Option<Self> {
+        fn line(
+            metadata: &std::collections::HashMap<String, String>,
+            prefix: &str,
+        ) -> Option<NarrationLine> {
+            let ssml = metadata.get(&format!("{prefix}.ssml"))?.trim();
+            (!ssml.is_empty()).then(|| NarrationLine {
+                ssml: ssml.to_owned(),
+                voice: metadata
+                    .get(&format!("{prefix}.voice"))
+                    .cloned()
+                    .unwrap_or_else(|| "VOICE1".into()),
+                provider: metadata
+                    .get(&format!("{prefix}.tts_provider"))
+                    .cloned()
+                    .unwrap_or_else(|| "SONANTIC_FAST".into()),
+            })
+        }
+        let intro = line(metadata, "narration.intro").or_else(|| line(metadata, "narration.jump"));
+        let outro = line(metadata, "narration.outro");
+        (intro.is_some() || outro.is_some()).then_some(Self { intro, outro })
+    }
+}
 
 enum PlayerState {
     Stopped,
@@ -927,6 +985,37 @@ struct PlayerTrackLoader {
 }
 
 impl PlayerTrackLoader {
+    async fn narration_decoder(&self, line: Option<&NarrationLine>) -> Option<Decoder> {
+        let line = line?;
+        let audio = match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.session
+                .spclient()
+                .get_narration_audio(&line.ssml, &line.voice, &line.provider),
+        )
+        .await
+        {
+            Ok(Ok(audio)) => audio,
+            Ok(Err(error)) => {
+                warn!("DJ narration unavailable: {error}");
+                return None;
+            }
+            Err(_) => {
+                warn!("DJ narration timed out");
+                return None;
+            }
+        };
+        let mut hint = Hint::new();
+        hint.mime_type("audio/mpeg");
+        match SymphoniaDecoder::new_narration(std::io::Cursor::new(audio.to_vec()), hint) {
+            Ok(decoder) => Some(Box::new(decoder)),
+            Err(error) => {
+                warn!("DJ narration could not be decoded: {error}");
+                None
+            }
+        }
+    }
+
     fn is_audio_key_unavailable(error: &Error) -> bool {
         matches!(
             error.error.downcast_ref::<AudioKeyError>(),
@@ -989,10 +1078,12 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<DjNarration>,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
         match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
-                self.load_remote_track(track_uri, position_ms).await
+                self.load_remote_track(track_uri, position_ms, narration)
+                    .await
             }
             SpotifyUri::Local { .. } => self
                 .load_local_track(track_uri, position_ms)
@@ -1009,6 +1100,7 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<DjNarration>,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
@@ -1234,6 +1326,23 @@ impl PlayerTrackLoader {
                     return Err(LoadError::Unavailable);
                 }
             };
+
+            if position_ms == 0 && !self.config.passthrough {
+                let intro = narration
+                    .as_ref()
+                    .and_then(|narration| narration.intro.as_ref());
+                let outro = narration
+                    .as_ref()
+                    .and_then(|narration| narration.outro.as_ref());
+                if intro.is_some() || outro.is_some() {
+                    let (intro, outro) =
+                        tokio::join!(self.narration_decoder(intro), self.narration_decoder(outro),);
+                    if intro.is_some() || outro.is_some() {
+                        decoder =
+                            Box::new(NarratedDecoder::new(intro, decoder, outro, duration_ms));
+                    }
+                }
+            }
 
             // Ensure streaming mode now that we are ready to play from the requested position.
             stream_loader_controller.set_stream_mode();
@@ -2002,6 +2111,7 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        narration: Option<DjNarration>,
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
@@ -2193,8 +2303,8 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader
+            .unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms, narration)));
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -2207,7 +2317,7 @@ impl PlayerInternal {
         Ok(())
     }
 
-    fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+    fn handle_command_preload(&mut self, track_id: SpotifyUri, narration: Option<DjNarration>) {
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
@@ -2250,7 +2360,7 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(track_id.clone(), 0, narration);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2275,6 +2385,7 @@ impl PlayerInternal {
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                None,
             );
         }
 
@@ -2331,9 +2442,13 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                narration,
+            } => self.handle_command_load(track_id, None, play, position_ms, narration)?,
 
-            PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+            PlayerCommand::Preload {
+                track_id,
+                narration,
+            } => self.handle_command_preload(track_id, narration),
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -2442,6 +2557,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<DjNarration>,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2461,7 +2577,7 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(loader.load_track(spotify_uri, position_ms, narration));
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -2533,7 +2649,7 @@ impl fmt::Debug for PlayerCommand {
                 .field(&play)
                 .field(&position_ms)
                 .finish(),
-            PlayerCommand::Preload { track_id } => {
+            PlayerCommand::Preload { track_id, .. } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
             PlayerCommand::Play => f.debug_tuple("Play").finish(),

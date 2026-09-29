@@ -22,6 +22,15 @@ enum Resolve {
     Context(Context),
 }
 
+const LEXICON_PREFIX: &str = "hm://lexicon-session-provider/";
+
+fn dj_context_url(context: &Context) -> Option<&str> {
+    (context.metadata.get("lexicon_set_type").map(String::as_str) == Some("your_dj"))
+        .then_some(context.url.as_deref())
+        .flatten()
+        .filter(|url| url.starts_with(LEXICON_PREFIX))
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(super) enum ContextAction {
     Append,
@@ -76,9 +85,8 @@ impl ResolveContext {
         // otherwise we might not even check if we need to fallback and just use the fallback uri
         match self.resolve {
             Resolve::Uri(ref uri) => ConnectState::valid_resolve_uri(uri),
-            Resolve::Context(ref ctx) => {
-                ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())
-            }
+            Resolve::Context(ref ctx) => dj_context_url(ctx)
+                .or_else(|| ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())),
         }
         .or(self.fallback.as_deref())
     }
@@ -124,6 +132,8 @@ pub struct ContextResolver {
     session: Session,
     queue: VecDeque<ResolveContext>,
     unavailable_contexts: HashMap<ResolveContext, Instant>,
+    dj_context_uri: Option<String>,
+    dj_next_page_url: Option<String>,
 }
 
 // time after which an unavailable context is retried
@@ -144,6 +154,8 @@ impl ContextResolver {
             session,
             queue: VecDeque::new(),
             unavailable_contexts: HashMap::new(),
+            dj_context_uri: None,
+            dj_next_page_url: None,
         }
     }
 
@@ -194,7 +206,19 @@ impl ContextResolver {
     }
 
     pub fn clear(&mut self) {
-        self.queue = VecDeque::new()
+        self.queue = VecDeque::new();
+        self.dj_context_uri = None;
+        self.dj_next_page_url = None;
+    }
+
+    pub fn dj_active(&self) -> bool {
+        self.dj_context_uri.is_some()
+    }
+
+    pub fn add_dj_page(&mut self) {
+        if let Some(url) = self.dj_next_page_url.clone() {
+            self.add(ResolveContext::append_context(url));
+        }
     }
 
     fn find_next(&self) -> Option<(&ResolveContext, &str, usize)> {
@@ -223,13 +247,41 @@ impl ContextResolver {
 
         match next.update {
             ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
-                if let Ok(ctx) = ctx.as_mut() {
+                if resolve_uri.starts_with(LEXICON_PREFIX) {
+                    if next.action == ContextAction::Append {
+                        let page = self
+                            .session
+                            .spclient()
+                            .get_context_page_url(resolve_uri)
+                            .await?;
+                        return Ok(Context {
+                            uri: self.dj_context_uri.clone(),
+                            pages: vec![page],
+                            ..Default::default()
+                        });
+                    }
+                    let mut ctx = self.session.spclient().get_context_url(resolve_uri).await?;
+                    if let Resolve::Context(ref original) = next.resolve {
+                        ctx.metadata.extend(original.metadata.clone());
+                    }
                     ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    ctx.url = Some(resolve_uri.to_string());
+                    return Ok(ctx);
                 }
-
-                ctx
+                let mut ctx = self.session.spclient().get_context(resolve_uri).await?;
+                if ctx.pages.iter().all(|page| page.tracks.is_empty())
+                    && let Some(url) = ctx.metadata.get("lexicon_context_url").cloned()
+                    && url.starts_with(LEXICON_PREFIX)
+                {
+                    let metadata = ctx.metadata;
+                    ctx = self.session.spclient().get_context_url(&url).await?;
+                    ctx.metadata.extend(metadata);
+                    ctx.url = Some(url);
+                } else {
+                    ctx.url = Some(format!("context://{}", next.context_uri()));
+                }
+                ctx.uri = Some(next.context_uri().to_string());
+                Ok(ctx)
             }
             ContextType::Autoplay => {
                 if resolve_uri.contains("spotify:show:") || resolve_uri.contains("spotify:episode:")
@@ -258,11 +310,25 @@ impl ContextResolver {
     }
 
     pub fn apply_next_context(
-        &self,
+        &mut self,
         state: &mut ConnectState,
         mut context: Context,
     ) -> Result<Option<Vec<ResolveContext>>, Error> {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
+
+        let dj_replace = next.action == ContextAction::Replace
+            && context.metadata.get("lexicon_set_type").map(String::as_str) == Some("your_dj");
+        let dj_append = next.action == ContextAction::Append
+            && next
+                .resolve_uri()
+                .is_some_and(|uri| uri.starts_with(LEXICON_PREFIX));
+        let dj_context_uri = context.uri.clone();
+        let dj_next_page_url = context
+            .pages
+            .last()
+            .and_then(|page| page.next_page_url.as_deref())
+            .filter(|url| url.starts_with(LEXICON_PREFIX))
+            .map(str::to_owned);
 
         let remaining = match next.action {
             ContextAction::Append if context.pages.len() == 1 => state
@@ -281,6 +347,16 @@ impl ContextResolver {
                 Err(ContextResolverError::UnexpectedPagesSize(context.pages.len()).into())
             }
         }?;
+
+        if dj_replace {
+            self.dj_context_uri = dj_context_uri;
+            self.dj_next_page_url = dj_next_page_url;
+        } else if dj_append {
+            self.dj_next_page_url = dj_next_page_url;
+        } else if next.action == ContextAction::Replace {
+            self.dj_context_uri = None;
+            self.dj_next_page_url = None;
+        }
 
         Ok(remaining.map(|remaining| {
             remaining
@@ -351,5 +427,39 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod dj_tests {
+    use super::*;
+
+    #[test]
+    fn dj_transfer_resolves_its_lexicon_url_instead_of_the_empty_playlist() {
+        let url = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:dj";
+        let context = Context {
+            uri: Some("spotify:playlist:dj".into()),
+            url: Some(url.into()),
+            metadata: [("lexicon_set_type".into(), "your_dj".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let resolve =
+            ResolveContext::from_context(context, ContextType::Default, ContextAction::Replace);
+        assert_eq!(resolve.resolve_uri(), Some(url));
+        assert_eq!(resolve.context_uri(), "spotify:playlist:dj");
+    }
+
+    #[test]
+    fn ordinary_playlist_does_not_use_lexicon_url() {
+        let context = Context {
+            uri: Some("spotify:playlist:ordinary".into()),
+            url: Some("hm://lexicon-session-provider/irrelevant".into()),
+            ..Default::default()
+        };
+        let resolve =
+            ResolveContext::from_context(context, ContextType::Default, ContextAction::Replace);
+        assert_eq!(resolve.resolve_uri(), Some("spotify:playlist:ordinary"));
     }
 }

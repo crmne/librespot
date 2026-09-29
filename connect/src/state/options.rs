@@ -44,6 +44,15 @@ impl ConnectState {
         }
     }
 
+    /// Social Connect toggles Jam with a `set_options` command containing
+    /// only modes. Preserve the other options and any modes it did not name.
+    pub fn set_modes(&mut self, modes: impl IntoIterator<Item = (String, String)>) {
+        self.add_options_if_empty();
+        if let Some(options) = self.player_mut().options.as_mut() {
+            options.modes.extend(modes);
+        }
+    }
+
     pub fn reset_options(&mut self) {
         self.set_shuffle(false);
         self.set_repeat_track(false);
@@ -109,5 +118,29 @@ impl ConnectState {
 
     pub fn repeat_track(&self) -> bool {
         self.player().options.repeating_track
+    }
+}
+
+#[cfg(test)]
+mod jam_tests {
+    use super::*;
+    use crate::core::Session;
+
+    #[tokio::test]
+    async fn jam_mode_updates_preserve_repeat_and_other_modes() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        state.set_repeat_context(true);
+        state.set_modes([
+            ("jam".into(), "on".into()),
+            ("context_enhancement".into(), "NONE".into()),
+        ]);
+        state.set_modes([("jam".into(), "off".into())]);
+        assert!(state.repeat_context());
+        assert_eq!(state.player().options.modes.get("jam"), Some(&"off".into()));
+        assert_eq!(
+            state.player().options.modes.get("context_enhancement"),
+            Some(&"NONE".into())
+        );
     }
 }

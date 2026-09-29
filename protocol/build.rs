@@ -52,6 +52,8 @@ fn compile() {
         proto_dir.join("context.proto"),
         proto_dir.join("restrictions.proto"),
         proto_dir.join("context_page.proto"),
+        proto_dir.join("client-tts.proto"),
+        proto_dir.join("tts-resolve.proto"),
         proto_dir.join("play_origin.proto"),
         proto_dir.join("suppressions.proto"),
         proto_dir.join("instrumentation_params.proto"),

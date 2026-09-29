@@ -357,14 +357,12 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
-    pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
-        let next = if self.repeat_track() {
-            self.current_track(|t| &t.uri)
+    pub fn preview_next_track(&mut self) -> Option<ProvidedTrack> {
+        if self.repeat_track() {
+            self.current_track(|t| t.as_ref().cloned())
         } else {
-            &self.next_tracks().first()?.uri
-        };
-
-        SpotifyUri::from_uri(next).ok()
+            self.next_tracks().first().cloned()
+        }
     }
 
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {

@@ -453,6 +453,12 @@ impl ConnectState {
             (_, Some(gid)) if !gid.is_empty() => SpotifyUri::Track {
                 id: SpotifyId::from_raw(gid)?,
             },
+            _ if ctx_track.metadata.contains_key("canonical_track_uri") => SpotifyUri::from_uri(
+                ctx_track
+                    .metadata
+                    .get("canonical_track_uri")
+                    .expect("checked by condition"),
+            )?,
             _ => Err(StateError::InvalidTrackUri(None))?,
         };
 

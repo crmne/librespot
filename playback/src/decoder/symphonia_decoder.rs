@@ -18,6 +18,7 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    mono_upmix: bool,
 }
 
 #[derive(Default)]
@@ -33,6 +34,21 @@ pub(crate) struct LocalFileMetadata {
 
 impl SymphoniaDecoder {
     pub fn new<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::new_with_mono(input, hint, false)
+    }
+
+    /// DJ's synthesized MP3 is mono even when it asks for 44.1 kHz output.
+    pub fn new_narration<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::new_with_mono(input, hint, true)
+    }
+
+    fn new_with_mono<R>(input: R, hint: Hint, allow_mono: bool) -> DecoderResult<Self>
     where
         R: MediaSource + 'static,
     {
@@ -77,7 +93,8 @@ impl SymphoniaDecoder {
         let channels = decoder.codec_params().channels.ok_or_else(|| {
             DecoderError::SymphoniaDecoder("Could not retrieve channel configuration".into())
         })?;
-        if channels.count() != NUM_CHANNELS as usize {
+        let mono_upmix = allow_mono && channels.count() == 1;
+        if channels.count() != NUM_CHANNELS as usize && !mono_upmix {
             return Err(DecoderError::SymphoniaDecoder(format!(
                 "Unsupported number of channels: {channels}"
             )));
@@ -89,6 +106,7 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            mono_upmix,
         })
     }
 
@@ -253,7 +271,15 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
+                    let samples = if self.mono_upmix {
+                        let mut stereo = Vec::with_capacity(sample_buffer.samples().len() * 2);
+                        for sample in sample_buffer.samples() {
+                            stereo.extend_from_slice(&[*sample, *sample]);
+                        }
+                        AudioPacket::Samples(stereo)
+                    } else {
+                        AudioPacket::Samples(sample_buffer.samples().to_vec())
+                    };
 
                     return Ok(Some((packet_position, samples)));
                 }

@@ -9,6 +9,8 @@ pub use passthrough_decoder::PassthroughDecoder;
 
 mod symphonia_decoder;
 pub use symphonia_decoder::SymphoniaDecoder;
+mod narrated_decoder;
+pub use narrated_decoder::NarratedDecoder;
 
 #[derive(Error, Debug)]
 pub enum DecoderError {
