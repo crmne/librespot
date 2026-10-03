@@ -42,7 +42,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::SAMPLES_PER_SECOND;
 
-const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 pub const DB_VOLTAGE_RATIO: f64 = 20.0;
 pub const PCM_AT_0DBFS: f64 = 1.0;
 
@@ -1427,6 +1426,21 @@ impl Future for PlayerInternal {
                         self.send_event(PlayerEvent::Preloading {
                             track_id: track_id.clone(),
                         });
+                        // Prefetch the first window of audio so switching
+                        // to this track starts without waiting for the
+                        // CDN. The wait blocks, so it runs on its own
+                        // thread and gives up once the stream is gone.
+                        let controller = loaded_track.stream_loader_controller.clone();
+                        let bytes_per_second = loaded_track.bytes_per_second;
+                        std::thread::spawn(move || {
+                            let window = (AudioFetchParams::get()
+                                .read_ahead_before_playback
+                                .as_secs_f32()
+                                * bytes_per_second as f32) as usize;
+                            if window > 0 {
+                                let _ = controller.fetch_next_and_wait(window, window);
+                            }
+                        });
                         self.preload = PlayerPreload::Ready {
                             track_id,
                             loaded_track: Box::new(loaded_track),
@@ -1582,29 +1596,26 @@ impl Future for PlayerInternal {
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
-                duration_ms,
                 stream_position_ms,
-                ref mut stream_loader_controller,
                 ref mut suggested_to_preload_next_track,
                 ..
             }
             | PlayerState::Paused {
                 ref track_id,
                 play_request_id,
-                duration_ms,
                 stream_position_ms,
-                ref mut stream_loader_controller,
                 ref mut suggested_to_preload_next_track,
                 ..
             } = self.state
             {
                 let track_id = track_id.clone();
 
-                if (!*suggested_to_preload_next_track)
-                    && ((duration_ms as i64 - stream_position_ms as i64)
-                        < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
-                    && stream_loader_controller.range_to_end_available()
-                {
+                // Suggest the preload as soon as playback has begun, not
+                // only near the end: skipping early in a track otherwise
+                // pays the whole load chain, and preloading only fetches
+                // the audio item, so an early suggestion is cheap.
+                let started = stream_position_ms > 0;
+                if !*suggested_to_preload_next_track && started {
                     *suggested_to_preload_next_track = true;
                     self.send_event(PlayerEvent::TimeToPreloadNextTrack {
                         track_id,

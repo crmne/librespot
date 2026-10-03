@@ -1,12 +1,18 @@
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use hyper::{Method, Request};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
 pub type SocketAddress = (String, u16);
+
+/// How long a cached resolve stays usable. A stale entry only costs a
+/// reconnect to a dead access point, which the retry loop covers; the age
+/// bounds how far the list can drift from Spotify's current one.
+const CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Default)]
 pub struct AccessPoints {
@@ -15,11 +21,18 @@ pub struct AccessPoints {
     spclient: VecDeque<SocketAddress>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ApResolveData {
     accesspoint: Vec<String>,
     dealer: Vec<String>,
     spclient: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedResolve {
+    /// When the data was fetched, in seconds since the Unix epoch.
+    saved_at_unix: u64,
+    data: ApResolveData,
 }
 
 impl ApResolveData {
@@ -94,8 +107,61 @@ impl ApResolver {
         Ok(data)
     }
 
+    fn load_cached(&self) -> Option<ApResolveData> {
+        let session = self.session();
+        let cache = session.cache()?;
+        let path = cache.apresolve_location()?;
+        let bytes = std::fs::read(path).ok()?;
+        let cached: CachedResolve = serde_json::from_slice(&bytes).ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        if now.saturating_sub(cached.saved_at_unix) > CACHE_MAX_AGE_SECS {
+            return None;
+        }
+        Some(cached.data)
+    }
+
+    fn save_cached(&self, data: &ApResolveData) {
+        let session = self.session();
+        let Some(cache) = session.cache() else {
+            return;
+        };
+        let Some(path) = cache.apresolve_location() else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let cached = CachedResolve {
+            saved_at_unix: now,
+            data: data.clone(),
+        };
+        match serde_json::to_vec(&cached) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!("Cannot save access points to cache: {e}");
+                }
+            }
+            Err(e) => warn!("Cannot serialise access points for the cache: {e}"),
+        }
+    }
+
     async fn apresolve(&self) {
+        if let Some(cached) = self.load_cached() {
+            let data = self.parse_resolve_to_access_points(cached);
+            // A cached resolve that filters down to an empty list (for
+            // example under a restricted port config) is as useless as a
+            // failed one, so let the network resolve replace it.
+            if !data.is_any_empty() {
+                self.lock(|inner| inner.data = data);
+                return;
+            }
+        }
+
         let result = self.try_apresolve().await;
+        if let Ok(data) = &result {
+            self.save_cached(data);
+        }
 
         self.lock(|inner| {
             let (data, error) = match result {

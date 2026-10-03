@@ -215,11 +215,16 @@ impl Spirc {
             .dealer()
             .handle_for("hm://connect-state/v1/player/command")?;
 
-        // pre-acquire client_token, preventing multiple request while running
-        let _ = session.spclient().client_token().await?;
-
-        // Connect *after* all message listeners are registered
-        session.connect(credentials, true).await?;
+        // The client token needs no connection and the handshake needs no
+        // client token, so fetch them together instead of one after the
+        // other. Connect still starts only after all message listeners are
+        // registered.
+        let (client_token, connected) = tokio::join!(
+            session.spclient().client_token(),
+            session.connect(credentials, true)
+        );
+        let _ = client_token?;
+        connected?;
 
         // pre-acquire access_token (we need to be authenticated to retrieve a token)
         let _ = session.login5().auth_token().await?;

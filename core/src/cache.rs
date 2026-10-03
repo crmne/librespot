@@ -388,6 +388,16 @@ impl Cache {
         }
     }
 
+    /// Where the last access-point resolve is cached, next to the volume
+    /// or credentials file when either is kept on disk.
+    pub fn apresolve_location(&self) -> Option<PathBuf> {
+        let anchor = self
+            .credentials_location
+            .as_ref()
+            .or(self.volume_location.as_ref())?;
+        Some(anchor.parent()?.join("apresolve.json"))
+    }
+
     pub fn file_path(&self, file: FileId) -> Option<PathBuf> {
         self.audio_location.as_ref().map(|location| {
             let name = file.to_base16();
