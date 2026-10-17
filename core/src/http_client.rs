@@ -110,7 +110,10 @@ impl HttpClient {
         let os_version = os_version();
 
         let (spotify_platform, os_version) = match OS {
-            "android" => ("Android", os_version),
+            // Spotifast signs in with the desktop (Keymaster) client on
+            // Android too, and login5 only accepts that client id with a
+            // desktop user-agent.
+            "android" => ("Linux", zero_str),
             "ios" => ("iOS", os_version),
             "macos" => ("OSX", zero_str),
             "windows" => ("Win32", zero_str),
